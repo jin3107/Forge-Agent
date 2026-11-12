@@ -17,7 +17,7 @@ jobs:
           cache: pip
 
       - name: Install
-        run: pip install -e .
+        run: pip install -e . "python-lsp-server[pyflakes,pycodestyle]"
 
       # Each scripts/test_*.py is a standalone suite that exits non-zero on failure.
       # Run all of them and report every failing suite instead of stopping at the first.
