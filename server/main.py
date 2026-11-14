@@ -4,39 +4,73 @@ Run:  uvicorn server.main:app --host 0.0.0.0 --port 8000
 """
 # ruff: noqa: B008 — FastAPI Depends trong default là DI idiom của toàn bộ routes.
 import asyncio
+import hashlib
 import io
 import json
+import logging
 import os
 import sys
 import time
 import zipfile
+from contextlib import aclosing, asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Literal
 
 import httpx
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictBool
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from engine import config, guard, llm, tools
+from engine import background, checkpoints, config, guard, llm, tools
+from engine.hook_review_requests import ReviewRequests
 from engine.agent import Agent, run_batch, run_battle, send_demo
+from engine.hooks import HookTrustDenied
 from engine.auth import CSRF_COOKIE, User, csrf_valid
 from engine.mcp import load_servers, save_servers
 from engine.mcp import manager as mcp_manager
 from engine.models import CAPABILITIES, ModelCapabilityError
 from engine.models import registry as model_registry
 from engine.models import router as model_router
-from engine.session import ScopedSessionStore, SessionStore
+from engine.session import ForkError, ScopedSessionStore, SessionStore
 from server import auth as auth_web
 from server.auth import require_admin, require_user
+from server.upload_limit import UploadRequestLimit
 
-app = FastAPI(title="Forge Agent", version="0.38.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    background.resume_starts()
+    try:
+        yield
+    finally:
+        # Wait concurrently so a slow spawn or checkpoint cleanup cannot delay
+        # signaling the independently tracked background process groups.
+        result, foreground_pending, checkpoint_pending = await asyncio.gather(
+            background.shutdown(), tools.wait_foreground_start_cleanups(),
+            checkpoints.wait_git_cleanups(), return_exceptions=True)
+        logger = logging.getLogger(__name__)
+        if isinstance(result, BaseException):
+            logger.warning("Background shutdown failed: %s", type(result).__name__)
+        elif result["pending_starts"] or result.get("pending_pumps", 0) or result["failures"]:
+            logger.warning("Background shutdown incomplete: %s", result)
+        if isinstance(foreground_pending, BaseException):
+            logger.warning("Foreground cleanup wait failed: %s", type(foreground_pending).__name__)
+        elif foreground_pending:
+            logger.warning("Foreground spawn cleanup incomplete: %s pending", foreground_pending)
+        if isinstance(checkpoint_pending, BaseException):
+            logger.warning("Checkpoint cleanup wait failed: %s", type(checkpoint_pending).__name__)
+        elif checkpoint_pending:
+            logger.warning("Checkpoint cleanup incomplete: %s pending", checkpoint_pending)
+
+
+app = FastAPI(title="Forge Agent", version="0.38.0", lifespan=lifespan)
 app.include_router(auth_web.router)
+# Security and CORS middleware registered below wrap this limiter.
+app.add_middleware(UploadRequestLimit)
 # Development giữ CORS mở cho tooling; release mặc định same-origin. Muốn mở
 # cross-origin phải liệt kê rõ FORGE_CORS_ORIGINS=https://app.example,...
 _cors = [x.strip() for x in os.environ.get("FORGE_CORS_ORIGINS", "").split(",") if x.strip()]
@@ -48,10 +82,22 @@ if _cors or not config.is_release_mode():
         allow_credentials=bool(_cors),
     )
 store = SessionStore()
+_hook_review_requests = ReviewRequests()
 
 
 def _db(user: User) -> ScopedSessionStore:
     return ScopedSessionStore(store, user.id, allow_mcp=user.role == "admin")
+
+
+def _checked_hook_runner(owner_id: str):
+    """Build a per-agent checked runner from the authenticated server scope."""
+    from .hook_runner import ScopedCheckedHookRunner
+    return ScopedCheckedHookRunner(
+        owner_id=owner_id,
+        resolve=lambda owner, session, workspace: _hook_scope_snapshot_with_inheritance(
+            owner, session, str(workspace)),
+        load_config=config.load_config)
+
 
 STATIC_DIR = ROOT / "server" / "static"
 
@@ -102,6 +148,12 @@ class SettingsBody(BaseModel):
 class FileSaveBody(BaseModel):
     path: str
     content: str
+    # Optional for older API clients; the editor always supplies this token.
+    expected_version: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class ConditionalFileSaveBody(FileSaveBody):
+    expected_version: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class McpServerBody(BaseModel):
@@ -191,7 +243,8 @@ def _pkg_version() -> str:
     """Đọc version pyproject 1 LẦN lúc import (không I/O trong request handler)."""
     try:
         import tomllib
-        return tomllib.load(open(ROOT / "pyproject.toml", "rb"))["project"]["version"]
+        with open(ROOT / "pyproject.toml", "rb") as source:
+            return tomllib.load(source)["project"]["version"]
     except Exception:  # noqa: BLE001 — thiếu version không được làm chết health
         return "?"
 
@@ -861,8 +914,11 @@ async def compact_session_ep(sid: str, body: dict | None = None, user: User = De
     if not s:
         raise HTTPException(404, "Session not found")
     from engine.agent import compact_session
-    agent = Agent(db, sid, router=model_router)
-    res = await compact_session(agent, (body or {}).get("instructions") or "")
+    agent = Agent(db, sid, router=model_router, hook_runner=_checked_hook_runner(user.id))
+    try:
+        res = await compact_session(agent, (body or {}).get("instructions") or "")
+    except HookTrustDenied as exc:
+        return {"ok": False, "code": "hook_trust_denied", "message": str(exc)}
     return res
 
 
@@ -883,7 +939,10 @@ async def init_agents_ep(sid: str, user: User = Depends(require_user)):
 async def fork_session(sid: str, user: User = Depends(require_user)):
     """🍴 Fork — nhân bản phiên: copy messages + workspace thành bản mới."""
     db = _db(user)
-    ns = db.fork(sid)
+    try:
+        ns = db.fork(sid)
+    except ForkError as exc:
+        raise HTTPException(409, str(exc)) from None
     if ns is None:
         raise HTTPException(404, "Session not found")
     return {"session": {"id": ns.id, "title": ns.title, "model": ns.model,
@@ -1033,12 +1092,6 @@ async def chat(sid: str, body: ChatBody, request: Request, user: User = Depends(
             if db.get(sub) is None:
                 raise HTTPException(404, "Session not found")
             res = await fwt.merge(sub, sid, sid, ws)
-            if res["ok"]:
-                try:
-                    from engine import checkpoints as fckpt
-                    await fckpt.snapshot(sid, ws, f"merge wt-{sub}")
-                except Exception:  # noqa: BLE001, S110 — snapshot lỗi không xoá kết quả merge
-                    pass
             wt_synthetic = [{"type": "assistant_message",
                              "content": ("✅ " if res["ok"] else "❌ ") + res["message"]}]
         elif w_arg.startswith("discard "):
@@ -1048,7 +1101,7 @@ async def chat(sid: str, body: ChatBody, request: Request, user: User = Depends(
             res = await fwt.discard(sub, sid)
             wt_synthetic = [{"type": "assistant_message",
                              "content": ("🗑 Đã bỏ worktree: " + ", ".join(res["removed"]))
-                                        if res["ok"] else "(không có worktree nào để bỏ)"}]
+                                        if res["ok"] else ("❌ " + res.get("message", "Không thể bỏ worktree"))}]
         else:
             own = {row["id"] for row in db.list()}
             rows = [row for row in await fwt.list_all() if row.get("session") in own]
@@ -1072,12 +1125,15 @@ async def chat(sid: str, body: ChatBody, request: Request, user: User = Depends(
                                "content": "⚪ Đã dừng loop." if was else "(không có loop nào đang chạy)"}]
         elif not l_arg:
             st_loop = fsched.manager.status(sid)
-            loop_synthetic = [{"type": "assistant_message",
-                               "content": ("🔁 Đang chạy: mỗi `" + fsched.fmt_interval(st_loop["every"])
-                                           + "` — «" + st_loop["text"] + "» ("
-                                           + str(st_loop["runs"]) + " lượt)"
-                                           if st_loop["running"] else
-                                           "Không có loop nào. Cú pháp: `/loop <30m|1h> <tác vụ>` · `/loop off`")}]
+            if st_loop.get("last_error_code") == "hook_trust_denied":
+                loop_message = ("⛔ Loop dừng: hook_trust_denied. " + st_loop["last_error"])
+            elif st_loop["running"]:
+                loop_message = ("🔁 Đang chạy: mỗi `" + fsched.fmt_interval(st_loop["every"])
+                                + "` — «" + st_loop["text"] + "» ("
+                                + str(st_loop["runs"]) + " lượt)")
+            else:
+                loop_message = "Không có loop nào. Cú pháp: `/loop <30m|1h> <tác vụ>` · `/loop off`"
+            loop_synthetic = [{"type": "assistant_message", "content": loop_message}]
         else:
             parts = l_arg.split(None, 1)
             every_s = fsched.parse_interval(parts[0], default_minutes=30)
@@ -1216,7 +1272,13 @@ async def chat(sid: str, body: ChatBody, request: Request, user: User = Depends(
                 # Client dùng done để phân biệt stream hoàn tất với kết nối bị cắt.
                 yield sse({"type": "done"})
                 return
-            agent = Agent(db, sid, model=model, router=model_router)
+            if demo:
+                agent = Agent(db, sid, model=model, router=model_router)
+            else:
+                # Partial enforcement: normal non-demo chat and manual compact;
+                # other server entry points remain outside this policy.
+                agent = Agent(db, sid, model=model, router=model_router,
+                              hook_runner=_checked_hook_runner(user.id))
             if demo:
                 demo_text = text
                 if images:
@@ -1247,6 +1309,9 @@ async def chat(sid: str, body: ChatBody, request: Request, user: User = Depends(
                                    "files": res["files"]})
                 except Exception as _ace:  # noqa: BLE001 — autocommit lỗi chỉ log, không chết lượt
                     print(f"[autocommit] bỏ qua: {_ace}")
+        except HookTrustDenied as exc:
+            # An auto-compaction trust denial stops the turn and skips auto-commit.
+            yield sse({"type": "error", "code": "hook_trust_denied", "message": str(exc)})
         except Exception as e:  # noqa: BLE001 — lỗi lượt phải report SSE, không chết stream
             yield sse({"type": "error", "message": f"Lỗi server: {e}"})
         yield sse({"type": "done"})
@@ -1279,11 +1344,12 @@ async def batch(body: BatchBody, request: Request, user: User = Depends(require_
 
     async def gen():
         try:
-            async for ev in run_batch(db, [{"prompt": p, "model": batch_model} for p in prompts],
-                                      demo=demo, router=model_router, language=body.language):
-                if await request.is_disconnected():
-                    return
-                yield sse(ev)
+            async with aclosing(run_batch(db, [{"prompt": p, "model": batch_model} for p in prompts],
+                                          demo=demo, router=model_router, language=body.language)) as source:
+                async for ev in source:
+                    if await request.is_disconnected():
+                        return
+                    yield sse(ev)
         except Exception as e:  # noqa: BLE001 — lỗi batch phải report SSE
             yield sse({"type": "error", "message": f"Lỗi batch: {e}"})
         yield sse({"type": "done"})
@@ -1309,11 +1375,12 @@ async def battle(body: BattleBody, request: Request, user: User = Depends(requir
 
     async def gen():
         try:
-            async for ev in run_battle(db, prompt, battle_models, demo=None, router=model_router,
-                                       language=body.language):
-                if await request.is_disconnected():
-                    return
-                yield sse(ev)
+            async with aclosing(run_battle(db, prompt, battle_models, demo=None, router=model_router,
+                                           language=body.language)) as source:
+                async for ev in source:
+                    if await request.is_disconnected():
+                        return
+                    yield sse(ev)
         except Exception as e:  # noqa: BLE001 — lỗi battle phải report SSE
             yield sse({"type": "error", "message": f"Lỗi battle: {e}"})
         yield sse({"type": "done"})
@@ -1334,11 +1401,16 @@ async def workspace_exec(sid: str, body: ExecBody, user: User = Depends(require_
         raise HTTPException(400, "Thiếu lệnh")
     verdict = guard.assess_command(cmd)
     if verdict["level"] == "danger" and config.load_config().get("approval_mode", "guarded") != "auto":
-        return {"blocked": True, "level": "danger", "reasons": verdict["reasons"],
+        return {"blocked": True, "ok": False, "exit_code": None, "timed_out": False,
+                "truncated": False, "level": "danger", "reasons": verdict["reasons"],
                 "output": f"BLOCKED: lệnh nguy hiểm ({'; '.join(verdict['reasons'])}). "
                           "Đổi sang Auto trong ⚙ nếu bạn thực sự muốn chạy."}
-    result = await tools.execute_tool("run_command", {"command": cmd}, ws)
-    return {"blocked": False, "ok": result["ok"], "output": result["output"]}
+    # A user typing directly into the terminal is the explicit action for ask mode;
+    # guarded-mode danger was checked above and Docker policy still applies.
+    terminal_override = config.load_config().get("approval_mode", "guarded") == "ask"
+    result = await tools.execute_tool("run_command", {"command": cmd}, ws, override=terminal_override)
+    return {key: result[key] for key in ("blocked", "ok", "output", "exit_code", "timed_out", "truncated", "checkpoint_status")
+            if key in result}
 
 
 @app.post("/api/workspace/open")
@@ -1385,14 +1457,270 @@ def _safe_path(ws: Path, rel: str) -> Path:
     return p
 
 
+@app.get("/api/workspace/hook-review")
+async def workspace_hook_review(sid: str, user: User = Depends(require_user)):
+    """Read-only preview; this endpoint does not approve or enforce hooks."""
+    from engine import hook_inspection
+    ws = _ws(sid, user)
+    try:
+        ws = ws.resolve(strict=True)
+        if not ws.is_dir():
+            raise OSError("workspace is not a directory")
+    except (OSError, RuntimeError):
+        raise HTTPException(409, "Workspace identity could not be resolved") from None
+    result = hook_inspection.inspect(ws)
+    cfg = result.config
+    hooks = cfg.get("hooks") if cfg is not None else None
+    legacy = cfg.get("on_file_change") if cfg is not None else None
+    return JSONResponse({
+        "workspace": str(ws),
+        "state": result.state,
+        "digest": result.digest,
+        "hooks": hooks,
+        "on_file_change": legacy,
+        "overrides_global_hooks": bool(hooks) if cfg is not None else None,
+        "enforcement_active": False,
+        "enforcement_scope": "normal_non_demo_chat_and_manual_compact",
+    }, headers={"Cache-Control": "no-store"})
+
+
+class HookReviewRequestBody(BaseModel):
+    sid: str = Field(min_length=1, max_length=256)
+    expected_workspace: str = Field(min_length=1, max_length=4096)
+    expected_digest: str = Field(pattern=r'^[0-9a-f]{64}$')
+    share_commands: StrictBool
+
+
+@app.post("/api/workspace/hook-review-requests")
+async def request_hook_review(body: HookReviewRequestBody, user: User = Depends(require_user)):
+    """Explicitly share review metadata and hook commands with admins; not approval."""
+    from engine import hook_inspection
+    if body.share_commands is not True:
+        raise HTTPException(422, "Explicit consent to share hook commands is required")
+    db = _db(user)
+    session = db.get(body.sid)
+    if not session or session.id != body.sid:
+        raise HTTPException(404, "Session not found")
+    try:
+        ws = db.workspace(session.id).resolve(strict=True)
+        if not ws.is_dir() or str(ws) != body.expected_workspace:
+            raise ValueError("workspace changed")
+    except (OSError, RuntimeError, ValueError):
+        raise HTTPException(409, "Workspace changed or could not be resolved; review again") from None
+    result = hook_inspection.inspect(ws)
+    if result.state != 'hooks' or result.digest != body.expected_digest:
+        raise HTTPException(409, "Hook configuration changed or cannot be reviewed; review again")
+    row = _hook_review_requests.submit(user.id, session.id, str(ws), result.digest, share_commands=True)
+    if row is None:
+        raise HTTPException(429, "Hook review request capacity reached; try again later")
+    return JSONResponse({"request_id": row.id, "enforcement_active": False, "enforcement_scope": "normal_non_demo_chat_and_manual_compact"}, headers={"Cache-Control":"no-store"})
+
+
+@app.get("/api/workspace/hook-review-requests")
+async def list_hook_review_requests(user: User = Depends(require_user)):
+    """Admins see explicitly shared metadata; other users see only their own."""
+    rows = _hook_review_requests.list()
+    if user.role != 'admin':
+        rows = [r for r in rows if r.owner_id == user.id]
+    return JSONResponse({"requests": [{"request_id":r.id, "owner_id":r.owner_id,
+                                      "session_id":r.session_id, "workspace":r.workspace,
+                                      "digest":r.digest, "status":r.status, "snapshot_revalidated":False} for r in rows],
+                         "enforcement_active":False, "enforcement_scope":"normal_non_demo_chat_and_manual_compact"}, headers={"Cache-Control":"no-store"})
+
+
+def _current_requested_workspace(row) -> Path | None:
+    """Revalidate the requesting owner, session and workspace without broadening ACLs."""
+    try:
+        owner = auth_web.auth_store.get(row.owner_id)
+        if not owner or not owner.enabled:
+            return None
+        scoped = ScopedSessionStore(store, row.owner_id, allow_mcp=False)
+        session = scoped.get(row.session_id)
+        if not session or session.id != row.session_id:
+            return None
+        ws = scoped.workspace(row.session_id).resolve(strict=True)
+        return ws if ws.is_dir() and str(ws) == row.workspace else None
+    except Exception:
+        # A failed recheck never authorizes disclosure; do not leak details.
+        return None
+
+
+def _hook_scope_snapshot(owner_id: str, session_id: str, workspace: str):
+    """Resolve review scope; caller must authenticate owner/session execution scope."""
+    from types import SimpleNamespace
+    from engine import hook_inspection
+    if (not isinstance(owner_id, str) or not owner_id.strip() or len(owner_id) > 256 or
+            not isinstance(session_id, str) or not session_id.strip() or len(session_id) > 256 or
+            not isinstance(workspace, str) or not workspace or len(workspace) > 4096):
+        return None
+    scope = SimpleNamespace(owner_id=owner_id, session_id=session_id, workspace=workspace)
+    def inspect_scope():
+        ws = _current_requested_workspace(scope)
+        if ws is None or str(ws) != workspace:
+            return hook_inspection.Inspection('invalid')
+        result = hook_inspection.inspect(ws)
+        if _current_requested_workspace(scope) != ws:
+            return hook_inspection.Inspection('invalid')
+        return result
+    def validate_admin(row):
+        admin = auth_web.auth_store.get(row.decided_by)
+        if not admin or not admin.enabled or admin.role != 'admin':
+            return False
+        current = _current_requested_workspace(scope)
+        if current is None or str(current) != workspace:
+            return False
+        admin = auth_web.auth_store.get(row.decided_by)
+        return bool(admin and admin.enabled and admin.role == 'admin')
+    return _hook_review_requests.scope_snapshot(owner_id, session_id, workspace, inspect_scope, validate_admin)
+
+
+def _hook_scope_snapshot_with_inheritance(owner_id: str, session_id: str, workspace: str):
+    """Resolve scoped approval for normal non-demo chat; other paths remain ungated.
+
+    The active parent comes from trusted internal lineage tracking, not a client
+    claim. Explicit child review records take precedence, including denial.
+    """
+    from types import SimpleNamespace
+    from engine import hook_inheritance, hook_inspection, hook_lineage
+    try:
+        def child_has_review():
+            return any(row.owner_id == owner_id and row.session_id == session_id
+                       for row in _hook_review_requests.list())
+        had_review = child_has_review()
+        direct = _hook_scope_snapshot(owner_id, session_id, workspace)
+        if direct is not None:
+            return direct
+        if had_review or child_has_review():
+            return None
+        ws = Path(workspace)
+        parent = hook_lineage.parent_for_shared_child(owner_id, session_id, ws)
+        if parent is None:
+            return None
+        def relation(owner, parent_id, child, path):
+            return (not child_has_review() and
+                    hook_lineage.is_shared_child(owner, parent_id, child, path))
+        def inspect_child(owner, child, path):
+            scope = SimpleNamespace(owner_id=owner, session_id=child, workspace=str(path))
+            current = _current_requested_workspace(scope)
+            return hook_inspection.inspect(current) if current is not None else None
+        return hook_inheritance.inherit_shared_snapshot(
+            owner_id=owner_id, parent_sid=parent, child_sid=session_id, workspace=ws,
+            resolve_parent=lambda owner, sid, path: _hook_scope_snapshot(owner, sid, str(path)),
+            validate_shared_relation=relation, inspect_child_scope=inspect_child)
+    except Exception:
+        return None
+
+
+def _approved_hook_snapshot(owner_id: str, session_id: str, workspace: str):
+    """Prototype for a future gate; caller must authenticate the execution scope.
+
+    Not wired to hook execution. Revocation, account and filesystem changes
+    after this function returns can make its result stale.
+    """
+    from engine import hook_inspection
+    def validate(row):
+        def admin_enabled():
+            admin = auth_web.auth_store.get(row.decided_by)
+            return bool(admin and admin.enabled and admin.role == 'admin')
+        if not admin_enabled():
+            return None
+        ws = _current_requested_workspace(row)
+        if ws is None:
+            return None
+        result = hook_inspection.inspect(ws)
+        if result.state != 'hooks' or result.raw is None or result.digest != row.digest:
+            return None
+        if _current_requested_workspace(row) != ws or not admin_enabled():
+            return None
+        return result.raw
+    return _hook_review_requests.approved_snapshot(owner_id, session_id, workspace, validate)
+
+
+@app.get("/api/workspace/hook-review-requests/{request_id}")
+async def admin_hook_review_request(request_id: str, user: User = Depends(require_admin)):
+    """Review explicitly shared hook config after revalidating its scope and digest."""
+    from engine import hook_inspection
+    row = _hook_review_requests.get(request_id)
+    if row is None or not row.share_commands:
+        raise HTTPException(404, "Review request not found")
+    ws = _current_requested_workspace(row)
+    if ws is None:
+        _hook_review_requests.invalidate(row)
+        raise HTTPException(409, "Review request is stale or unavailable; submit a new request")
+    result = hook_inspection.inspect(ws)
+    if result.state != 'hooks' or result.digest != row.digest or result.config is None:
+        _hook_review_requests.invalidate(row)
+        raise HTTPException(409, "Review request is stale or unavailable; submit a new request")
+    if _hook_review_requests.get(request_id) != row:
+        raise HTTPException(409, "Review request changed or is unavailable")
+    if _current_requested_workspace(row) != ws:
+        _hook_review_requests.invalidate(row)
+        raise HTTPException(409, "Review request is stale or unavailable; submit a new request")
+    # The scope recheck itself may overlap a revoke, expiry or decision.
+    if _hook_review_requests.get(request_id) != row:
+        raise HTTPException(409, "Review request changed or is unavailable")
+    cfg = result.config
+    return JSONResponse({"request_id":row.id, "owner_id":row.owner_id, "session_id":row.session_id,
+                         "workspace":row.workspace, "digest":row.digest, "status":row.status,
+                         "hooks":cfg.get('hooks'), "on_file_change":cfg.get('on_file_change'),
+                         "overrides_global_hooks":bool(cfg.get('hooks')),
+                         "enforcement_active":False, "enforcement_scope":"normal_non_demo_chat_and_manual_compact"}, headers={"Cache-Control":"no-store"})
+
+
+class HookReviewDecisionBody(BaseModel):
+    decision: Literal['approve', 'deny']
+    expected_workspace: str = Field(min_length=1, max_length=4096)
+    expected_digest: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+@app.post("/api/workspace/hook-review-requests/{request_id}/decision")
+async def decide_hook_review_request(request_id: str, body: HookReviewDecisionBody,
+                                     user: User = Depends(require_admin)):
+    """Record an admin decision; enforcement covers only some execution paths."""
+    from engine import hook_inspection
+    def validate(row) -> bool:
+        ws = _current_requested_workspace(row)
+        if ws is None:
+            return False
+        result = hook_inspection.inspect(ws)
+        admin = auth_web.auth_store.get(user.id)
+        return bool(result.state == 'hooks' and result.digest == row.digest
+                    and _current_requested_workspace(row) == ws
+                    and admin and admin.enabled and admin.role == 'admin')
+    status = _hook_review_requests.decide(request_id, user.id,
+        'approved' if body.decision == 'approve' else 'denied',
+        body.expected_workspace, body.expected_digest, validate)
+    if status == 'missing':
+        raise HTTPException(404, "Review request not found")
+    if status not in ('approved', 'denied'):
+        raise HTTPException(409, "Review request changed, expired or is no longer actionable")
+    return JSONResponse({"request_id":request_id, "status":status, "enforcement_active":False, "enforcement_scope":"normal_non_demo_chat_and_manual_compact"},
+                        headers={"Cache-Control":"no-store"})
+
+
+@app.delete("/api/workspace/hook-review-requests/{request_id}")
+async def revoke_hook_review_request(request_id: str, user: User = Depends(require_user)):
+    if not _hook_review_requests.revoke(request_id, user.id, user.role == 'admin'):
+        raise HTTPException(404, "Review request not found")
+    return JSONResponse({"ok":True, "enforcement_active":False, "enforcement_scope":"normal_non_demo_chat_and_manual_compact"}, headers={"Cache-Control":"no-store"})
+
+
 @app.get("/api/workspace/tree")
 async def workspace_tree(sid: str, user: User = Depends(require_user)):
     ws = _ws(sid, user)
+    root = ws.resolve()
+
+    def contained(path: Path) -> bool:
+        try:
+            return not path.is_symlink() and path.resolve().is_relative_to(root)
+        except (OSError, RuntimeError):
+            return False
 
     def node(path: Path, depth: int) -> list[dict]:
         items: list[dict] = []
         try:
-            entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+            entries = sorted((p for p in path.iterdir() if contained(p)),
+                             key=lambda p: (p.is_file(), p.name.lower()))
         except Exception:  # noqa: BLE001 — tree lỗi trả rỗng, không chết request
             return []
         for e in entries:
@@ -1415,52 +1743,252 @@ async def read_workspace_file(sid: str, path: str, user: User = Depends(require_
     p = _safe_path(ws, path)
     if not p.exists() or not p.is_file():
         raise HTTPException(404, "File not found")
-    raw = p.read_bytes()
-    if b"\x00" in raw[:2000]:
-        return {"path": path, "binary": True, "content": ""}
-    return {"path": path, "binary": False, "content": raw.decode("utf-8", "replace")}
+    # Reject rather than return truncated content that could later be saved over
+    # the original. The extra byte detects files that exceed the preview limit.
+    with p.open("rb") as f:
+        raw = f.read(4 * 1024 * 1024 + 1)
+    if len(raw) > 4 * 1024 * 1024:
+        raise HTTPException(413, "File too large to preview (limit: 4 MiB)")
+    # Never expose a lossy UTF-8 replacement decode as editable text.
+    # The binary flag also covers text in other encodings and NUL-containing
+    # content; it is a conservative preview policy, not a file-type detector.
+    if b"\x00" in raw:
+        return {"path": path, "binary": True, "content": "", "version": hashlib.sha256(raw).hexdigest()}
+    try:
+        text = raw.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        return {"path": path, "binary": True, "content": "", "version": hashlib.sha256(raw).hexdigest()}
+    return {"path": path, "binary": False, "content": text,
+            "version": hashlib.sha256(raw).hexdigest()}
+
+
+def _require_file_version(path: Path, expected: str, action: str = "saved") -> None:
+    # Bound this re-read to the same maximum size as the editor preview. A
+    # missing, unreadable or enlarged file is a conflict, not permission to save.
+    try:
+        if not path.is_file():
+            raise OSError("not a regular file")
+        with path.open("rb") as f:
+            data = f.read(4 * 1024 * 1024 + 1)
+    except OSError as exc:
+        raise HTTPException(409, f"File changed or cannot be verified; file was not {action}") from exc
+    if len(data) > 4 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != expected:
+        raise HTTPException(409, f"File changed since it was opened; file was not {action}")
 
 
 @app.put("/api/workspace/file")
 async def save_workspace_file(sid: str, body: FileSaveBody, user: User = Depends(require_user)):
     ws = _ws(sid, user)
     p = _safe_path(ws, body.path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(body.content, encoding="utf-8")
-    return {"ok": True, "path": body.path, "size": len(body.content)}
+    if p == ws.resolve() or p.is_dir():
+        raise HTTPException(400, "Path must be a file")
+    encoded = None
+    if body.expected_version is not None:
+        if "\x00" in body.content:
+            raise HTTPException(422, "NUL character in editor content; file was not saved")
+        try:
+            encoded = body.content.encode("utf-8", "strict")
+        except UnicodeEncodeError as exc:
+            raise HTTPException(422, "Content is not valid UTF-8; file was not saved") from exc
+        if len(encoded) > 4 * 1024 * 1024:
+            raise HTTPException(413, "File too large to save in editor (limit: 4 MiB UTF-8)")
+        _require_file_version(p, body.expected_version)
+    outcome = {"status": "failed"}
+    try:
+        await checkpoints.snapshot(checkpoints.key_for(ws), ws,
+                                   f"workspace save: {body.path[:60]}", outcome=outcome)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Workspace save checkpoint failed (%s)", type(exc).__name__)
+        raise HTTPException(500, "Checkpoint error; file was not saved") from exc
+    # The await above allows workspace selection or path symlinks to change.
+    # Re-check both; filesystem operations are still not atomic against races.
+    if _ws(sid, user).resolve() != ws.resolve():
+        raise HTTPException(409, "Workspace changed; file was not saved")
+    checked = _safe_path(ws, body.path)
+    if checked != p or checked.is_dir():
+        raise HTTPException(409, "File path changed; file was not saved")
+    if body.expected_version is not None:
+        _require_file_version(checked, body.expected_version)
+    checked.parent.mkdir(parents=True, exist_ok=True)
+    checked.write_text(body.content, encoding="utf-8", newline="")
+    result = {"ok": True, "path": body.path, "size": len(body.content),
+              "checkpoint_status": outcome["status"]}
+    if encoded is not None:
+        result["version"] = hashlib.sha256(encoded).hexdigest()
+    if outcome["status"] != "created":
+        result["warning"] = ("No new checkpoint was confirmed; "
+                             "undo may not restore the state before this save.")
+    else:
+        result["notice"] = ("Checkpoint created; undo may not restore files excluded "
+                            "from the snapshot or ignored by Git.")
+    return result
+
+
+@app.put("/api/workspace/file/conditional")
+async def save_workspace_file_conditional(sid: str, body: ConditionalFileSaveBody,
+                                          user: User = Depends(require_user)):
+    # Old servers must reject this route, not silently ignore a version field.
+    return await save_workspace_file(sid, body, user=user)
+
+
+@app.post("/api/workspace/file")
+async def create_workspace_file(sid: str, body: FileSaveBody, user: User = Depends(require_user)):
+    ws = _ws(sid, user)
+    p = _safe_path(ws, body.path)
+    if p == ws.resolve() or p.is_dir():
+        raise HTTPException(400, "Path must be a file")
+    if (ws / body.path).is_symlink() or p.exists():
+        raise HTTPException(409, "File already exists; it was not overwritten")
+    outcome = {"status": "failed"}
+    try:
+        await checkpoints.snapshot(checkpoints.key_for(ws), ws,
+                                   f"workspace create: {body.path[:60]}", outcome=outcome)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Workspace create checkpoint failed (%s)", type(exc).__name__)
+        raise HTTPException(500, "Checkpoint error; file was not created") from exc
+    if _ws(sid, user).resolve() != ws.resolve():
+        raise HTTPException(409, "Workspace changed; file was not created")
+    checked = _safe_path(ws, body.path)
+    if checked != p or (ws / body.path).is_symlink() or checked.is_dir():
+        raise HTTPException(409, "File path changed; file was not created")
+    checked.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Exclusive creation prevents overwriting a file created after checks.
+        with checked.open("x", encoding="utf-8", newline="") as f:
+            f.write(body.content)
+    except FileExistsError as exc:
+        raise HTTPException(409, "File already exists; it was not overwritten") from exc
+    result = {"ok": True, "path": body.path, "size": len(body.content),
+              "checkpoint_status": outcome["status"]}
+    if outcome["status"] != "created":
+        result["warning"] = ("No new checkpoint was confirmed; "
+                             "undo may not restore the state before this creation.")
+    else:
+        result["notice"] = ("Checkpoint created; undo may not restore files excluded "
+                            "from the snapshot or ignored by Git.")
+    return result
 
 
 @app.delete("/api/workspace/file")
-async def delete_workspace_file(sid: str, path: str, user: User = Depends(require_user)):
+async def delete_workspace_file(sid: str, path: str, user: User = Depends(require_user),
+                                expected_version: Annotated[str | None, Query(pattern=r"^[0-9a-f]{64}$")] = None):
     ws = _ws(sid, user)
     p = _safe_path(ws, path)
-    if p.exists():
-        p.unlink()
-        return {"ok": True}
-    raise HTTPException(404, "File not found")
+    if p == ws.resolve() or p.is_dir():
+        raise HTTPException(400, "Path must be a file")
+    if expected_version is not None:
+        _require_file_version(p, expected_version, action="deleted")
+    elif not p.exists():
+        raise HTTPException(404, "File not found")
+    outcome = {"status": "failed"}
+    try:
+        await checkpoints.snapshot(checkpoints.key_for(ws), ws,
+                                   f"workspace delete: {path[:60]}", outcome=outcome)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Workspace delete checkpoint failed (%s)", type(exc).__name__)
+        raise HTTPException(500, "Checkpoint error; file was not deleted") from exc
+    # Recheck after awaiting, though the check and unlink are not atomic.
+    if _ws(sid, user).resolve() != ws.resolve():
+        raise HTTPException(409, "Workspace changed; file was not deleted")
+    checked = _safe_path(ws, path)
+    if checked != p or not checked.exists() or checked.is_dir():
+        raise HTTPException(409, "File path changed; file was not deleted")
+    if expected_version is not None:
+        _require_file_version(checked, expected_version, action="deleted")
+    checked.unlink()
+    result = {"ok": True, "checkpoint_status": outcome["status"]}
+    if outcome["status"] != "created":
+        result["warning"] = ("No new checkpoint was confirmed; "
+                             "undo may not restore the state before this deletion.")
+    else:
+        result["notice"] = ("Checkpoint created; undo may not restore files excluded "
+                            "from the snapshot or ignored by Git.")
+    return result
+
+
+@app.delete("/api/workspace/file/conditional")
+async def delete_workspace_file_conditional(
+    sid: str, path: str,
+    expected_version: Annotated[str, Query(pattern=r"^[0-9a-f]{64}$")],
+    user: User = Depends(require_user),
+):
+    # A distinct endpoint makes old servers fail closed rather than silently
+    # ignoring the new version query argument on their legacy DELETE route.
+    return await delete_workspace_file(sid, path, user=user, expected_version=expected_version)
 
 
 @app.post("/api/workspace/upload")
-async def upload_files(sid: str, files: list[UploadFile] = File(...), user: User = Depends(require_user)):
+async def upload_files(sid: str, files: list[UploadFile] = File(...), user: User = Depends(require_user),
+                       overwrite: Annotated[bool, Form()] = False):
     ws = _ws(sid, user)
     saved, skipped = [], []
+    outcome = None
     MAX_SIZE = 20 * 1024 * 1024
     for f in files[:20]:
         name = Path(f.filename or "").name  # strip any path components
         if not name or name.startswith("."):
             skipped.append(f.filename or "?")
             continue
-        data = await f.read()
+        raw_path = ws / name
+        if not overwrite and (raw_path.is_symlink() or raw_path.exists()):
+            skipped.append(f"{name} (already exists)")
+            continue
+        # Read only one byte beyond the limit to detect oversize files. The
+        # multipart parser has already received/spooled the request at this point.
+        data = await f.read(MAX_SIZE + 1)
         if len(data) > MAX_SIZE:
             skipped.append(f"{name} (>20MB)")
             continue
+        if not overwrite and (raw_path.is_symlink() or raw_path.exists()):
+            skipped.append(f"{name} (already exists)")
+            continue
         p = _safe_path(ws, name)
-        p.write_bytes(data)
+        if p == ws.resolve() or p.is_dir():
+            raise HTTPException(400, "Path must be a file")
+        if outcome is None:
+            outcome = {"status": "failed"}
+            try:
+                await checkpoints.snapshot(checkpoints.key_for(ws), ws,
+                                           "workspace upload", outcome=outcome)
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Workspace upload checkpoint failed (%s)", type(exc).__name__)
+                raise HTTPException(500, "Checkpoint error; upload was not started") from exc
+        # Both reading and checkpointing can yield; recheck on every write.
+        # These checks are not atomic with the write.
+        if _ws(sid, user).resolve() != ws.resolve():
+            raise HTTPException(409, "Workspace changed; upload may be partial")
+        if not overwrite and raw_path.is_symlink():
+            skipped.append(f"{name} (already exists)")
+            continue
+        checked = _safe_path(ws, name)
+        if checked != p or checked.is_dir():
+            raise HTTPException(409, "File path changed; upload may be partial")
+        if overwrite:
+            checked.write_bytes(data)
+        else:
+            try:
+                with checked.open("xb") as dest:
+                    dest.write(data)
+            except FileExistsError:
+                skipped.append(f"{name} (already exists)")
+                continue
         saved.append(name)
-    if saved:
-        # refresh tree cache implicitly (none) — return
-        pass
-    return {"saved": saved, "skipped": skipped}
+    # Report every unprocessed part without reading it. Limit reflected names so
+    # unusually long multipart filenames do not inflate this new response field.
+    for index, f in enumerate(files[20:], start=21):
+        name = Path(f.filename or "").name or "?"
+        display = name[:200] + ("…" if len(name) > 200 else "")
+        skipped.append(f"#{index}: {display} (over 20-file limit)")
+    result = {"saved": saved, "skipped": skipped}
+    if outcome is not None:
+        result["checkpoint_status"] = outcome["status"]
+        if outcome["status"] != "created":
+            result["warning"] = ("No new checkpoint was confirmed; "
+                                 "undo may not restore the state before this upload.")
+        else:
+            result["notice"] = ("Checkpoint created; undo may not restore files excluded "
+                                "from the snapshot or ignored by Git.")
+    return result
 
 
 @app.get("/api/workspace/export")

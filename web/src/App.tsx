@@ -3,6 +3,7 @@ import { api } from './api'
 import type { AuthUser } from './api'
 import { uid } from './types'
 import type { AgentEvent, BatchEvent, ChatMode, FileNode, Item, SessionSummary, Settings, TaskGroup, Usage, ModelInfo } from './types'
+import { batchTaskStatus } from './batchTaskStatus'
 import { Sidebar } from './components/Sidebar'
 import { FilesPane } from './components/FilesPane'
 import { SettingsModal } from './components/SettingsModal'
@@ -13,6 +14,8 @@ import { ElicitationCard } from './components/ElicitationCard'
 import { Markdown } from './md'
 import { LoginScreen } from './components/LoginScreen'
 import { useI18n, type Translate } from './i18n'
+import { saveCheckpointNotice, saveCheckpointWarning, deleteCheckpointNotice, deleteCheckpointWarning, uploadCheckpointNotice, uploadCheckpointWarning, createCheckpointNotice, createCheckpointWarning } from './checkpoint'
+import { canSaveWorkspaceFile, inspectLineEndings, restoreLineEndings, localizeUploadSkip, validFileVersion, fitsEditorSaveLimit, type LineEndingStyle } from './workspace-editor'
 
 const MODES: { id: ChatMode; icon: string; label: [string, string]; desc: [string, string] }[] = [
   { id: 'direct', icon: '💬', label: ['Trực tiếp', 'Direct'], desc: ['Chat thuần — không dùng tool, nhanh và rẻ', 'Plain chat — no tools, fast and inexpensive'] },
@@ -23,7 +26,7 @@ const MODES: { id: ChatMode; icon: string; label: [string, string]; desc: [strin
 ]
 
 /** Pure reducer: apply one agent event to an item timeline. */
-function applyEvent(prev: Item[], ev: AgentEvent, translate: Translate = (vi) => vi): Item[] {
+export function applyEvent(prev: Item[], ev: AgentEvent, translate: Translate = (vi) => vi): Item[] {
   switch (ev.type) {
     case 'reasoning_delta': {
       const last = prev[prev.length - 1]
@@ -59,7 +62,7 @@ function applyEvent(prev: Item[], ev: AgentEvent, translate: Translate = (vi) =>
     case 'tool_result':
       return prev.map((it) =>
         it.kind === 'tool' && it.callId === ev.id
-          ? { ...it, output: ev.output, ok: ev.ok, diff: ev.diff }
+          ? { ...it, output: ev.output, ok: ev.ok, diff: ev.diff, checkpointStatus: ev.checkpoint_status }
           : it,
       )
     case 'approval_request':
@@ -155,8 +158,16 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
   const [sid, setSid] = useState<string | null>(null)
   const sidRef = useRef<string | null>(null)
+  const fileOpenSeq = useRef(0)
+  const fileRevision = useRef(0)
+  const fileIdentity = useRef(0)
+  const fileSaveBusy = useRef(false)
+  const fileDeleteBusy = useRef(false)
+  const fileTransitionBusy = useRef(false)
   const savedModelsRef = useRef<Record<string, string>>({})
   const activateSession = useCallback((id: string | null) => {
+    // Invalidate pending file reads and clear editor when changing sessions.
+    if (sidRef.current !== id) closeFile()
     // Ref phải đổi đồng bộ để response chậm của phiên trước không thể ghi đè phiên mới.
     sidRef.current = id
     setSid(id)
@@ -167,7 +178,14 @@ export default function App() {
   const [tree, setTree] = useState<FileNode[]>([])
   const [fileSel, setFileSel] = useState<string | null>(null)
   const [fileContent, setFileContent] = useState<string | null>(null)
+  const [fileBinary, setFileBinary] = useState(false)
+  const [fileVersion, setFileVersion] = useState<string | null>(null)
+  const [fileLineEndings, setFileLineEndings] = useState<LineEndingStyle>('lf')
   const [fileDirty, setFileDirty] = useState(false)
+  const [fileSaving, setFileSaving] = useState(false)
+  const [fileDeleting, setFileDeleting] = useState(false)
+  const [fileDeleted, setFileDeleted] = useState(false)
+  const [fileTransitionLocked, setFileTransitionLocked] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [errorBanner, setErrorBanner] = useState<string | null>(null)
   const [parallel, setParallel] = useState(false)
@@ -393,6 +411,16 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [settingsOpen])
 
+  useEffect(() => {
+    if (!fileDirty) return
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [fileDirty])
+
   // autoscroll while streaming — chỉ khi người dùng đang ở gần đáy (tôn trọng cuộn tay)
   useEffect(() => {
     const el = chatScrollRef.current
@@ -442,12 +470,11 @@ export default function App() {
               if (g.index !== ev.index) return g
               const inner = ev.event
               const next: TaskGroup = { ...g, items: applyEvent(g.items, inner as AgentEvent, t) }
-              if (inner.type === 'task_done') next.status = 'done'
-              if (inner.type === 'error') next.status = 'error'
+              next.status = batchTaskStatus(g.status, inner)
               return next
             }) ?? null)
           } else if (ev.type === 'batch_done') {
-            setBatch((prev) => prev?.map((g) => ({ ...g, status: g.status === 'error' ? 'error' : 'done' })) ?? null)
+            setBatch((prev) => prev?.map((g) => ({ ...g, status: g.status === 'error' || ev.tasks.find((task) => task.index === g.index)?.ok === false ? 'error' : 'done' })) ?? null)
           } else if (ev.type === 'error') {
             setErrorBanner(ev.message)
           }
@@ -509,12 +536,24 @@ export default function App() {
   }
 
   // ------------------------------------------------------------ sessions
-  async function newSession() {
+  function confirmDiscardUnsaved(): boolean {
+    return !fileDirty || confirm(t('File đang có chỉnh sửa chưa lưu. Bỏ các chỉnh sửa này?', 'The open file has unsaved edits. Discard them?'))
+  }
+
+  async function newSession(afterDelete = false) {
+    if (!afterDelete && (fileTransitionBusy.current || !confirmDiscardUnsaved())) return
     if (streaming) stop()
     const owner = userRef.current?.id
+    const previousSid = sidRef.current
+    const revision = fileRevision.current
     const s = await api.createSession(activeModel || undefined)
     if (!owner || userRef.current?.id !== owner) return
     savedModelsRef.current[s.id] = s.model
+    if (sidRef.current !== previousSid || fileRevision.current !== revision) {
+      refreshSessions()
+      setInfo(t('Đã tạo phiên mới nhưng không chuyển phiên vì editor đã thay đổi.', 'New session created but not opened because the editor changed.'))
+      return
+    }
     activateSession(s.id)
     setActiveModel(s.model)
     setModelSaveState('idle')
@@ -528,66 +567,190 @@ export default function App() {
   }
 
   async function selectSession(id: string) {
+    if (fileTransitionBusy.current) return
+    if (id === sidRef.current) { setShowSb(false); return }
+    if (!confirmDiscardUnsaved()) return
     if (streaming) stop()
     setShowSb(false)
     if (window.matchMedia('(max-width: 1100px)').matches) setShowWorkspace(false)
     activateSession(id)
     setModelSaveState('idle')
-    setFileSel(null); setFileContent(null)
+    closeFile()
     await loadSession(id)
     refreshTree(id)
   }
 
   async function deleteSession(id: string) {
-    await api.deleteSession(id)
-    if (id === sid) await newSession()
-    refreshSessions()
+    if (fileTransitionBusy.current) return
+    const deletingCurrent = id === sidRef.current
+    if (deletingCurrent && !confirmDiscardUnsaved()) return
+    if (deletingCurrent) { fileTransitionBusy.current = true; setFileTransitionLocked(true) }
+    try {
+      await api.deleteSession(id)
+      if (deletingCurrent && sidRef.current === id) await newSession(true)
+      refreshSessions()
+    } catch (e) { setErrorBanner(String(e)) }
+    finally {
+      if (deletingCurrent) { fileTransitionBusy.current = false; setFileTransitionLocked(false) }
+    }
   }
 
   // --------------------------------------------------------------- files
-  async function openFile(path: string) {
-    if (!sid) return
+  async function openFile(path: string, discardApproved = false) {
+    if (!sid || sidRef.current !== sid || fileTransitionBusy.current) return
+    if (!discardApproved && !confirmDiscardUnsaved()) return
+    const request = ++fileOpenSeq.current
     try {
       const f = await api.readFile(sid, path)
+      if (sidRef.current !== sid || fileOpenSeq.current !== request) return
+      fileRevision.current++
+      fileIdentity.current++
       setFileSel(path)
-      setFileContent(f.binary ? t('// (file nhị phân — không xem được)', '// (binary file — preview unavailable)') : f.content)
+      setFileBinary(f.binary)
+      setFileDeleted(false)
+      setFileVersion(validFileVersion(f.version) ? f.version : null)
+      const lines = f.binary ? {style: 'lf' as const, normalized: ''} : inspectLineEndings(f.content)
+      setFileLineEndings(lines.style)
+      setFileContent(f.binary ? t('// (file nhị phân hoặc không phải UTF-8 — không xem hoặc sửa được)', '// (binary or non-UTF-8 file — preview and editing unavailable)') : lines.normalized)
       setFileDirty(false)
-    } catch (e) { setErrorBanner(String(e)) }
+    } catch (e) {
+      if (sidRef.current === sid && fileOpenSeq.current === request) setErrorBanner(String(e))
+    }
   }
 
-  function closeFile() { setFileSel(null); setFileContent(null); setFileDirty(false) }
+  function closeFile() {
+    fileOpenSeq.current++
+    fileRevision.current++
+    fileIdentity.current++
+    setFileSel(null); setFileContent(null); setFileBinary(false); setFileDeleted(false); setFileVersion(null); setFileLineEndings('lf'); setFileDirty(false)
+  }
 
   async function saveFile() {
-    if (!sid || fileSel === null || fileContent === null) return
-    await api.saveFile(sid, fileSel, fileContent)
-    setFileDirty(false)
-    refreshTree(sid)
+    if (!canSaveWorkspaceFile(sid, fileSel, fileContent, fileBinary || fileLineEndings === 'mixed') || !sid || fileSel === null || fileContent === null || !validFileVersion(fileVersion) || sidRef.current !== sid || fileSaveBusy.current || fileDeleteBusy.current || fileTransitionBusy.current) return
+    if (fileContent.includes('\0')) {
+      setErrorBanner(t('Không lưu được: nội dung chứa ký tự NUL. Bản sửa vẫn ở đây; hãy xóa ký tự đó hoặc sao chép nội dung.', 'Cannot save: content contains a NUL character. Your draft remains here; remove the character or copy the content.'))
+      return
+    }
+    const serialized = restoreLineEndings(fileContent, fileLineEndings)
+    if (!fitsEditorSaveLimit(serialized)) {
+      setErrorBanner(t('Không lưu được: nội dung vượt 4 MiB khi mã hóa UTF-8. Bản sửa vẫn ở đây; hãy rút ngắn hoặc sao chép nội dung.', 'Cannot save: content exceeds 4 MiB encoded as UTF-8. Your draft remains here; shorten or copy it.'))
+      return
+    }
+    const revision = fileRevision.current
+    const identity = fileIdentity.current
+    fileSaveBusy.current = true
+    setFileSaving(true)
+    setInfo(null)
+    setErrorBanner(null)
+    try {
+      const result = await api.saveFile(sid, fileSel, serialized, fileVersion)
+      if (sidRef.current !== sid) return
+      const versionConfirmed = validFileVersion(result.version)
+      if (fileIdentity.current === identity) setFileVersion(versionConfirmed ? result.version! : null)
+      const warning = saveCheckpointWarning(result.checkpoint_status, t)
+      const changed = fileRevision.current !== revision
+        ? t(' Nội dung hoặc file đang mở đã thay đổi trong lúc lưu; hãy kiểm tra các chỉnh sửa chưa lưu.', ' The open file or its contents changed during saving; check for unsaved edits.')
+        : ''
+      const versionWarning = !versionConfirmed
+        ? t(' File đã lưu nhưng server không xác nhận phiên bản; cần mở lại file trước khi sửa tiếp.', ' File was saved but the server did not confirm its version; reopen the file before editing again.')
+        : ''
+      if (warning || versionWarning) setErrorBanner((warning ?? '') + versionWarning + changed)
+      else setInfo(saveCheckpointNotice(t) + changed)
+      if (fileRevision.current === revision) setFileDirty(false)
+      refreshTree(sid)
+    } catch (e) {
+      if (sidRef.current === sid && fileIdentity.current === identity) {
+        if ((e as {status?: number})?.status === 409) {
+          setErrorBanner(t('File đã thay đổi hoặc không còn sẵn trên đĩa. Bản sửa chưa được lưu; hãy sao chép nội dung trước khi mở lại file.', 'The file changed or is no longer available on disk. Your edits were not saved; copy them before reopening the file.'))
+        } else setErrorBanner(t(`Không xác nhận được kết quả lưu; file có thể đã được ghi. Hãy sao chép bản sửa và kiểm tra workspace: ${String(e)}`, `Could not confirm the save; the file may already have been written. Copy your draft and check the workspace: ${String(e)}`))
+      }
+    } finally {
+      fileSaveBusy.current = false
+      setFileSaving(false)
+    }
   }
 
   async function deleteFile() {
-    if (!sid || !fileSel) return
-    if (!confirm(t(`Xóa ${fileSel}?`, `Delete ${fileSel}?`))) return
-    await api.deleteFile(sid, fileSel)
-    closeFile()
-    refreshTree(sid)
+    if (!sid || !fileSel || fileTransitionBusy.current || fileDeleteBusy.current || fileSaveBusy.current || !validFileVersion(fileVersion)) return
+    const message = fileDirty
+      ? t(`Xóa ${fileSel}? Các chỉnh sửa chưa lưu sẽ bị bỏ.`, `Delete ${fileSel}? Unsaved edits will be discarded.`)
+      : t(`Xóa ${fileSel}?`, `Delete ${fileSel}?`)
+    if (!confirm(message)) return
+    if (sidRef.current !== sid) return
+    const request = ++fileOpenSeq.current
+    const revision = fileRevision.current
+    const identity = fileIdentity.current
+    fileDeleteBusy.current = true
+    setFileDeleting(true)
+    setInfo(null)
+    setErrorBanner(null)
+    try {
+      const result = await api.deleteFile(sid, fileSel, fileVersion)
+      if (sidRef.current !== sid) return
+      const warning = deleteCheckpointWarning(result.checkpoint_status, t)
+      if (fileOpenSeq.current === request && fileRevision.current === revision) {
+        closeFile()
+        if (warning) setErrorBanner(warning)
+        else setInfo(deleteCheckpointNotice(t))
+      } else if (fileIdentity.current === identity) {
+        // The editor changed while deletion was pending; keep its contents for
+        // copying, but don't let it save or delete the now-deleted file.
+        setFileVersion(null)
+        setFileDeleted(true)
+        const draftWarning = t('File đã bị xóa trong khi editor thay đổi. Nội dung đang hiển thị chỉ để sao chép; hãy sao chép bản sửa trước khi mở file khác.', 'The file was deleted while the editor changed. The displayed contents are read-only; copy any draft before opening another file.')
+        setErrorBanner([warning, draftWarning].filter(Boolean).join(' '))
+      } else if (warning) setErrorBanner(warning)
+      else setInfo(deleteCheckpointNotice(t))
+      refreshTree(sid)
+    } catch (e) {
+      if (sidRef.current === sid && fileIdentity.current === identity) {
+        if ((e as {status?: number})?.status === 409) setErrorBanner(t('File đã thay đổi hoặc không còn sẵn trên đĩa; không xóa file. Hãy sao chép bản sửa chưa lưu trước khi mở lại.', 'The file changed or is no longer available on disk; it was not deleted. Copy any unsaved edits before reopening.'))
+        else setErrorBanner(t(`Không xác nhận được kết quả xóa; file có thể đã bị xóa. Hãy sao chép bản sửa và kiểm tra workspace: ${String(e)}`, `Could not confirm deletion; the file may have been deleted. Copy any draft and check the workspace: ${String(e)}`))
+      }
+    } finally {
+      fileDeleteBusy.current = false
+      setFileDeleting(false)
+    }
   }
 
   async function newFile() {
-    if (!sid) return
+    if (!sid || fileTransitionBusy.current || !confirmDiscardUnsaved()) return
     const p = prompt(t('Đường dẫn file mới:', 'New file path:'), 'untitled.py')
-    if (!p) return
-    await api.saveFile(sid, p, '')
-    refreshTree(sid)
-    openFile(p)
+    if (!p || sidRef.current !== sid) return
+    const request = ++fileOpenSeq.current
+    setInfo(null)
+    setErrorBanner(null)
+    try {
+      const result = await api.createFile(sid, p)
+      if (sidRef.current !== sid) return
+      const warning = createCheckpointWarning(result.checkpoint_status, t)
+      if (warning) setErrorBanner(warning)
+      else setInfo(createCheckpointNotice(t))
+      refreshTree(sid)
+      if (fileOpenSeq.current === request) openFile(p, true)
+    } catch (e) {
+      if (sidRef.current !== sid) return
+      setErrorBanner(t(`Không tạo được file; hãy kiểm tra workspace vì file có thể đã tồn tại hoặc được tạo một phần: ${String(e)}`, `Could not create file; check the workspace because the file may exist or be partially created: ${String(e)}`))
+      refreshTree(sid)
+    }
   }
 
   async function uploadFiles(fs: FileList | null) {
     if (!sid || !fs || fs.length === 0) return
+    setInfo(null)
+    setErrorBanner(null)
     try {
       const r = await api.uploadFiles(sid, Array.from(fs))
-      if (r.skipped.length) setErrorBanner(t(`Bỏ qua: ${r.skipped.join(', ')}`, `Skipped: ${r.skipped.join(', ')}`))
+      const warning = r.saved.length ? uploadCheckpointWarning(r.checkpoint_status, t) : null
+      const skippedNames = r.skipped.map((item) => localizeUploadSkip(item, t)).join(', ')
+      const skipped = skippedNames ? t(`Bỏ qua: ${skippedNames}`, `Skipped: ${skippedNames}`) : null
+      if (warning || skipped) setErrorBanner([warning, skipped].filter(Boolean).join(' '))
+      if (r.saved.length && !warning) setInfo(uploadCheckpointNotice(t))
       refreshTree(sid)
-    } catch (e) { setErrorBanner(String(e)) }
+    } catch (e) {
+      setErrorBanner(t(`Tải lên thất bại; một số file có thể đã được tải lên: ${String(e)}`, `Upload failed; some files may already have been uploaded: ${String(e)}`))
+      refreshTree(sid)
+    }
   }
 
   function exportWorkspace() {
@@ -608,11 +771,17 @@ export default function App() {
   }
 
   async function doFork() {
-    if (!sid || streaming || busyTool) return
+    if (!sid || streaming || busyTool || fileTransitionBusy.current || !confirmDiscardUnsaved()) return
+    const revision = fileRevision.current
     setBusyTool('fork')
     try {
       const r = await api.fork(sid)
       if (r.session?.id) {
+        if (sidRef.current !== sid || fileRevision.current !== revision) {
+          refreshSessions()
+          setInfo(t('Đã fork nhưng không chuyển phiên vì editor đã thay đổi.', 'Fork created but not opened because the editor changed.'))
+          return
+        }
         activateSession(r.session.id); await loadSession(r.session.id); refreshSessions(); refreshTree(r.session.id)
         setInfo(t(`🍴 Đã fork → phiên mới ${r.session.id}`, `🍴 Forked → new session ${r.session.id}`))
       }
@@ -812,16 +981,24 @@ export default function App() {
   }
 
   async function logout() {
+    if (fileTransitionBusy.current || !confirmDiscardUnsaved()) return
+    fileTransitionBusy.current = true
+    setFileTransitionLocked(true)
     abortRef.current?.abort()
-    try { await api.logout() } catch { /* session có thể đã hết hạn */ }
-    savedModelsRef.current = {}
-    userRef.current = null
-    setUser(null); setSessions([]); activateSession(null); setItems([]); setTree([]); setSettings(null)
     try {
-      const d = await api.authMe()
-      setGoogleEnabled(d.google_enabled); setRegistrationEnabled(d.registration_enabled)
-      setNeedsSetup(d.needs_setup)
-    } catch { /* login vẫn hiển thị với policy đã nạp trước đó */ }
+      try { await api.logout() } catch { /* session có thể đã hết hạn */ }
+      savedModelsRef.current = {}
+      userRef.current = null
+      setUser(null); setSessions([]); activateSession(null); setItems([]); setTree([]); setSettings(null)
+      try {
+        const d = await api.authMe()
+        setGoogleEnabled(d.google_enabled); setRegistrationEnabled(d.registration_enabled)
+        setNeedsSetup(d.needs_setup)
+      } catch { /* login vẫn hiển thị với policy đã nạp trước đó */ }
+    } finally {
+      fileTransitionBusy.current = false
+      setFileTransitionLocked(false)
+    }
   }
 
   if (authLoading) return <main className="login-page"><div className="auth-loading">{t('⚡ Đang kiểm tra phiên…', '⚡ Checking your session…')}</div></main>
@@ -840,7 +1017,7 @@ export default function App() {
           sessions={sessions}
           currentId={sid}
           onSelect={selectSession}
-          onNew={newSession}
+          onNew={() => { void newSession() }}
           onDelete={deleteSession}
           demo={settings.demo}
           model={activeModel || settings.model}
@@ -1095,12 +1272,20 @@ export default function App() {
       {showWorkspace && <button className="workspace-scrim" aria-label={t('Đóng vùng Workspace', 'Close Workspace area')} onClick={() => setShowWorkspace(false)} />}
       <FilesPane
         sid={sid ?? ''}
+        isAdmin={user.role === 'admin'}
         tree={tree}
         selected={fileSel}
         content={fileContent}
+        binary={fileBinary}
+        missingVersion={!validFileVersion(fileVersion)}
+        mixedNewlines={fileLineEndings === 'mixed'}
         dirty={fileDirty}
+        saving={fileSaving}
+        deleting={fileDeleting}
+        deleted={fileDeleted}
+        locked={fileTransitionLocked}
         onOpen={openFile}
-        onChange={(c) => { setFileContent(c); setFileDirty(true) }}
+        onChange={(c) => { if (!fileBinary && validFileVersion(fileVersion) && fileLineEndings !== 'mixed' && !fileTransitionBusy.current) { fileOpenSeq.current++; fileRevision.current++; setFileContent(c); setFileDirty(true) } }}
         onSave={saveFile}
         onDelete={deleteFile}
         onRefresh={() => sid && refreshTree(sid)}

@@ -125,12 +125,14 @@ export interface FileNode {
   children?: FileNode[]
 }
 
+export type CheckpointStatus = 'created' | 'disabled' | 'unavailable' | 'failed'
+
 export type AgentEvent =
   | { type: 'reasoning_delta'; text: string }
   | { type: 'assistant_delta'; text: string }
   | { type: 'assistant_message'; content: string | null; tool_calls: ToolCall[] | null }
   | { type: 'tool_start'; id: string; name: string; args: Record<string, unknown> }
-  | { type: 'tool_result'; id: string; name: string; args: Record<string, unknown>; ok: boolean; output: string; diff?: string; path?: string }
+  | { type: 'tool_result'; id: string; name: string; args: Record<string, unknown>; ok: boolean; output: string; diff?: string; path?: string; checkpoint_status?: CheckpointStatus }
   | { type: 'compacting'; chars: number }
   | { type: 'compacted'; ok: boolean; before?: number; after?: number }
   | { type: 'subagent_started'; id: string; session_id: string; task: string; model?: string }
@@ -145,15 +147,15 @@ export type AgentEvent =
   | { type: 'turn_end'; usage: unknown; session_usage?: Usage; cost_usd?: number | null; message_count: number }
   | { type: 'todo_update'; items: TodoItem[] }
   | { type: 'mcp_ready'; tools: string[] }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; code?: string }
   | { type: 'done' }
 
-export type TaskDoneEvent = { type: 'task_done'; index: number; session_id: string }
+export type TaskDoneEvent = { type: 'task_done'; index: number; session_id: string; ok?: boolean }
 
 export type BatchEvent =
   | { type: 'task_created'; index: number; session_id: string; title: string; model?: string }
   | { type: 'task_event'; index: number; event: AgentEvent | TaskDoneEvent }
-  | { type: 'batch_done'; tasks: { index: number; session_id: string; title: string; model?: string }[] }
+  | { type: 'batch_done'; ok?: boolean; tasks: { index: number; session_id: string; title: string; model?: string; ok?: boolean }[] }
   | { type: 'error'; message: string }
   | { type: 'done' }
 
@@ -180,6 +182,7 @@ export type Item =
       output: string | null
       ok: boolean | null
       diff?: string
+      checkpointStatus?: CheckpointStatus
     }
   | {
       kind: 'approval'

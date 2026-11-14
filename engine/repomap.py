@@ -42,11 +42,13 @@ _CACHE: dict[tuple[str, int, tuple], dict] = {}
 def _iter_files(workspace: Path) -> list[Path]:
     out: list[Path] = []
     try:
+        root = workspace.resolve()
         for p in sorted(workspace.rglob("*")):
             rel = p.relative_to(workspace)
             if any(part in SKIP_DIRS for part in rel.parts[:-1]) or p.name in SKIP_DIRS:
                 continue
-            if p.is_file() and p.stat().st_size < 300_000:
+            if (not p.is_symlink() and p.resolve().is_relative_to(root)
+                    and p.is_file() and p.stat().st_size < 300_000):
                 out.append(p)
                 if len(out) >= MAX_FILES_SCAN:
                     break

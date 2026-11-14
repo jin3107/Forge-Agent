@@ -26,8 +26,9 @@ from rich.panel import Panel                         # noqa: E402
 from rich.text import Text                           # noqa: E402
 
 from engine import config                            # noqa: E402
+from engine.hooks import HookTrustDenied                # noqa: E402
 from engine.agent import Agent, send_demo, run_batch  # noqa: E402
-from engine.session import SessionStore              # noqa: E402
+from engine.session import ForkError, SessionStore   # noqa: E402
 
 console = Console()
 store = SessionStore()
@@ -120,6 +121,9 @@ async def run_turn(session_id: str, user_text: str, model: str | None = None,
                     result["usage"] = ev.get("usage") or result["usage"]
                 elif t == "error":
                     result["error"] = ev.get("message")
+        except HookTrustDenied as denial:
+            result["error"] = str(denial)
+            result["error_code"] = "hook_trust_denied"
         finally:
             store.save(store.get(session_id))
         print(_json.dumps(result, ensure_ascii=False, indent=2))
@@ -219,6 +223,10 @@ async def run_turn(session_id: str, user_text: str, model: str | None = None,
                     su_cost = su.get("cost_usd")
                     extra = f" · cộng dồn phiên ~${su_cost:.4f}" if su_cost else ""
                     console.print(f"[dim]💵 Chi phí lượt này: ~${ev['cost_usd']:.4f}{extra}[/dim]")
+    except HookTrustDenied as denial:
+        live.stop()
+        console.print(Panel(str(denial), title="Hook trust denied", border_style="red"))
+        return 1
     finally:
         try:
             live.stop()
@@ -388,7 +396,11 @@ async def interactive(session_id: str | None, model: str | None) -> None:
             ins = text[8:].strip()
             agent = Agent(store, session_id, model=model)
             console.print("  [dim]🧹 Đang tóm tắt hội thoại…[/dim]")
-            res = await compact_session(agent, ins)
+            try:
+                res = await compact_session(agent, ins)
+            except HookTrustDenied as denial:
+                console.print(Panel(str(denial), title="Hook trust denied", border_style="red"))
+                continue
             if res.get("ok"):
                 console.print(f"  [green]✅ Đã nén {res['before']} → {res['after']} tin nhắn[/green]")
             else:
@@ -551,7 +563,7 @@ async def interactive(session_id: str | None, model: str | None) -> None:
                 console.print(("✅ " if res["ok"] else "❌ ") + res["message"])
             elif w_arg.startswith("discard "):
                 res = await fwt.discard(w_arg[8:].strip(), session_id)
-                console.print(("🗑 " + ", ".join(res["removed"])) if res["ok"] else "(không có gì để bỏ)")
+                console.print(("🗑 " + ", ".join(res["removed"])) if res["ok"] else ("❌ " + res.get("message", "Không thể bỏ worktree")))
             else:
                 rows = await fwt.list_all()
                 if not rows:
@@ -676,7 +688,11 @@ async def interactive(session_id: str | None, model: str | None) -> None:
             await run_turn(session_id, text, model=model)  # expand trong run_turn
             continue
         if text == "/fork":
-            ns = store.fork(session_id)
+            try:
+                ns = store.fork(session_id)
+            except ForkError as exc:
+                console.print(f"[red]⚠ {exc}[/red]")
+                continue
             if ns:
                 session_id = ns.id
                 console.print(f"[green]🍴 Đã fork → phiên mới:[/green] {session_id}")
@@ -714,6 +730,8 @@ async def interactive(session_id: str | None, model: str | None) -> None:
 
 
 async def main_async() -> int:
+    from engine.hooks import enable_local_hook_policy
+    enable_local_hook_policy()
     ap = argparse.ArgumentParser(prog="forge")
     ap.add_argument("--once", metavar="PROMPT", help="chạy 1 lượt rồi thoát")
     ap.add_argument("--mode", default="agent", choices=["direct", "agent", "plan"],
@@ -770,5 +788,8 @@ async def main_async() -> int:
 if __name__ == "__main__":
     try:
         sys.exit(asyncio.run(main_async()))
+    except HookTrustDenied as denial:
+        console.print(Panel(str(denial), title="Hook trust denied", border_style="red"))
+        sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)
