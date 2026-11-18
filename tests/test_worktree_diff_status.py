@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 from engine import agent as mod, checkpoints, config, worktree
 from engine.session import SessionStore, ScopedSessionStore
+from _win_compat import overwrite_file
 
 @unittest.skipUnless(shutil.which('git'),'Git required')
 class WorktreeDiffStatus(unittest.IsolatedAsyncioTestCase):
@@ -25,7 +26,7 @@ class WorktreeDiffStatus(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['ok']); self.assertIn('file',result['stat'])
 
     async def test_invalid_binding_and_git_failure_are_errors_not_empty_success(self):
-        (self.wt/'.git').write_text('gitdir: /nonexistent\n')
+        overwrite_file(self.wt/'.git', 'gitdir: /nonexistent\n')
         result=await worktree.diff_stat_result(self.child.id,self.sid)
         self.assertFalse(result['ok']); self.assertEqual(result['stat'],'')
         self.assertEqual(await worktree.diff_stat(self.child.id,self.sid),'')
@@ -41,7 +42,7 @@ class WorktreeDiffStatus(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(result['ok']); self.assertNotIn('private error',str(result))
 
     async def test_list_reports_unavailable_for_corrupt_git_metadata(self):
-        (self.wt/'.git').write_text('gitdir: /nonexistent\n')
+        overwrite_file(self.wt/'.git', 'gitdir: /nonexistent\n')
         rows=await worktree.list_all(); row=next(r for r in rows if r['session']==self.child.id)
         self.assertFalse(row['diff_ok']); self.assertNotIn('không khác',row['stat'])
         self.assertIn('không thể',row['stat'].lower())
@@ -51,7 +52,7 @@ class WorktreeDiffStatus(unittest.IsolatedAsyncioTestCase):
             def __init__(self,store,sid,**kwargs): self.workspace=store.workspace(sid)
             async def send(self,task):
                 (self.workspace/'file').write_text('child ran\n')
-                (self.workspace/'.git').write_text('gitdir: /nonexistent\n')
+                overwrite_file(self.workspace/'.git', 'gitdir: /nonexistent\n')
                 yield {'type':'assistant_message','content':'child completed'}
         with patch.object(mod,'Agent',FakeChild):
             events=[event async for event in self.agent._run_subagent('call','task',None,'worktree')]

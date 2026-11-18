@@ -25,7 +25,7 @@ class SlowStream(httpx.AsyncByteStream):
 
 
 class FetchDeadline(unittest.IsolatedAsyncioTestCase):
-    async def run_mock(self, handler, limit=0.12):
+    async def run_mock(self, handler, limit=0.12, outer=0.8):
         original = httpx.AsyncClient
         def factory(*args, **kwargs):
             kwargs['transport'] = httpx.MockTransport(handler)
@@ -33,7 +33,7 @@ class FetchDeadline(unittest.IsolatedAsyncioTestCase):
         with patch.object(tools, 'FETCH_TOTAL_TIMEOUT', limit, create=True), \
              patch('engine.tools._public_addresses', return_value=['93.184.216.34']), \
              patch('httpx.AsyncClient', side_effect=factory):
-            return await asyncio.wait_for(tools._fetch_url(None, {'url': 'https://example.com/'}), 0.8)
+            return await asyncio.wait_for(tools._fetch_url(None, {'url': 'https://example.com/'}), outer)
 
     async def test_slow_body_deadline_closes_stream(self):
         stream = SlowStream()
@@ -46,9 +46,11 @@ class FetchDeadline(unittest.IsolatedAsyncioTestCase):
         calls = []
         async def handler(request):
             calls.append(request)
-            await asyncio.sleep(0.07)
+            await asyncio.sleep(0.15)
             return httpx.Response(302, headers={'location': '/next'})
-        result = await self.run_mock(handler)
+        # Wider budget than the other tests: building the httpx client is slow on Windows
+        # and counts against the deadline, which starved the first request at 0.12s.
+        result = await self.run_mock(handler, limit=0.5, outer=3)
         self.assertIn('timeout', result.lower())
         self.assertGreaterEqual(len(calls), 2)
         self.assertLess(len(calls), 6)

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from engine import checkpoints, config, worktree
+from _win_compat import overwrite_file
 
 @unittest.skipUnless(shutil.which('git'), 'Git required')
 class DiscardSafety(unittest.IsolatedAsyncioTestCase):
@@ -56,6 +57,6 @@ class DiscardSafety(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.wt.exists()); self.assertTrue(self.child_repo.exists())
 
     async def test_altered_git_pointer_is_not_deleted(self):
-        (self.wt/'.git').write_text('gitdir: /nonexistent\n')
+        overwrite_file(self.wt/'.git', 'gitdir: /nonexistent\n')
         result=await worktree.discard('child','parent')
         self.assertFalse(result['ok'],result); self.assertTrue(self.wt.exists()); self.assertTrue(self.child_repo.exists())

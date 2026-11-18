@@ -2,6 +2,7 @@
 import asyncio
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,7 +31,7 @@ class ForegroundDeadline(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return proc
         argv = [sys.executable, '-u', '-c', 'import time; time.sleep(30)']
-        command = 'exec ' + ' '.join(shlex.quote(s) for s in argv) if os.name == 'posix' else ' '.join(argv)
+        command = 'exec ' + ' '.join(shlex.quote(s) for s in argv) if os.name == 'posix' else subprocess.list2cmdline(argv)
         task = None
         try:
             with patch('engine.tools._prepare_command', return_value=(None, argv if exec_path else None)), \

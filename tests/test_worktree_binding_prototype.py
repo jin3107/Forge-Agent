@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 from engine import config, worktree, worktree_base
 from engine.session import SessionStore, ScopedSessionStore
+from _win_compat import overwrite_file
 
 @unittest.skipUnless(shutil.which('git'),'Git required')
 class WorktreeBindingPrototype(unittest.IsolatedAsyncioTestCase):
@@ -83,7 +84,7 @@ class WorktreeBindingPrototype(unittest.IsolatedAsyncioTestCase):
         rc,_=await worktree._run('-C',str(self.wt),'checkout','--detach'); self.assertEqual(rc,0)
         self.assertFalse(await self.validate())
         rc,_=await worktree._run('-C',str(self.wt),'checkout',f'iso/{self.child.id}'); self.assertEqual(rc,0)
-        (self.wt/'.git').write_text('gitdir: /nonexistent\n')
+        overwrite_file(self.wt/'.git', 'gitdir: /nonexistent\n')
         self.assertFalse(await self.validate())
 
     async def test_changed_forge_ref_rejected(self):

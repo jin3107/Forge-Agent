@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from engine import hook_inspection
+from _win_compat import can_create_symlinks
 
 
 class WorkspaceHookInspection(unittest.TestCase):
@@ -119,7 +120,7 @@ class WorkspaceHookInspection(unittest.TestCase):
         self.assertEqual(result.state, 'invalid')
         self.assertNotIn('SECRET_PATH', repr(result))
 
-    @unittest.skipUnless(hasattr(os, 'symlink'), 'requires symlinks')
+    @unittest.skipUnless(can_create_symlinks(), 'requires symlink privilege')
     def test_rejects_symlink_config_and_parent(self):
         target = self.ws / 'other.json'
         target.write_text('{"hooks":{}}')

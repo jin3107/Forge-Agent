@@ -7,13 +7,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 from engine import checkpoints
+from _win_compat import newline_in_filenames_supported
 
 
 class UndoTrackedExcludes(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_tracked_exclusion_blocks_before_mutation(self):
         if not checkpoints.available():
             self.skipTest('git unavailable')
-        for relative in ('.venv/important.txt', 'folder\nname/node_modules/important.txt'):
+        relatives = ['.venv/important.txt']
+        if newline_in_filenames_supported():  # Windows cannot create such names
+            relatives.append('folder\nname/node_modules/important.txt')
+        for relative in relatives:
             with self.subTest(relative=relative), tempfile.TemporaryDirectory(prefix='forge-undo-legacy-') as td:
                 root = Path(td)
                 ws = root / 'workspace'

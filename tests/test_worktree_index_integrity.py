@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 from engine import checkpoints, config, worktree
+from _win_compat import overwrite_file
 
 
 @unittest.skipUnless(shutil.which('git'),'Git required')
@@ -62,7 +63,7 @@ class WorktreeIndexIntegrity(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((self.parent/'new.txt').exists())
 
     async def test_modified_git_pointer_is_rejected(self):
-        before=self.index(); (self.wt/'.git').write_text('gitdir: /nonexistent/test-git-dir\n')
+        before=self.index(); overwrite_file(self.wt/'.git', 'gitdir: /nonexistent/test-git-dir\n')
         self.assertEqual(await worktree.diff_stat(self.sub,self.sid,self.wt),'')
         result=await worktree.merge(self.sub,self.sid,self.sid,self.parent)
         self.assertFalse(result['ok']); self.assertEqual(self.index(),before)
