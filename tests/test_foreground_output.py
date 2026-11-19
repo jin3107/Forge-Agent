@@ -108,8 +108,10 @@ class ForegroundOutput(unittest.IsolatedAsyncioTestCase):
         proc.wait.assert_awaited_once()
 
     async def test_timeout_reports_partial_output_and_truncation(self):
-        code = "import sys,time; sys.stdout.write('x'*70000); sys.stdout.flush(); time.sleep(5)"
-        result = await self.run_command(code, timeout_sec=1)
+        # The command has five seconds to start and write before the timeout; a one-second
+        # budget was shorter than interpreter start-up on a slow Windows machine.
+        code = "import sys,time; sys.stdout.write('x'*70000); sys.stdout.flush(); time.sleep(8)"
+        result = await self.run_command(code, timeout_sec=5)
         self.assertTrue(result["timed_out"], result)
         self.assertFalse(result["ok"])
         self.assertIsNone(result["exit_code"])

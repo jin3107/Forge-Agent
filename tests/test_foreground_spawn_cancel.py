@@ -56,6 +56,7 @@ class ForegroundSpawnCancellation(unittest.IsolatedAsyncioTestCase):
                         proc.kill()
                         await asyncio.wait_for(proc.wait(), 3)
 
+    @unittest.skipUnless(os.name == 'posix', 'outside POSIX only the shell is stopped; the command would outlive the test')
     async def test_cancel_shell_spawn_cleans_created_process(self):
         await self.run_cancelled_spawn(False)
 

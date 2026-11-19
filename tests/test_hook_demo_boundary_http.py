@@ -52,7 +52,8 @@ class DemoBoundaryHTTP(unittest.IsolatedAsyncioTestCase):
                         sid=created.json()['session']['id']; ws=root/'data'/'workspaces'/sid
                         ws.mkdir(parents=True,exist_ok=True); (ws/'.forge').mkdir(exist_ok=True)
                         marker=ws/'workspace-hook-ran'
-                        cmd=f'{shlex.quote(sys.executable)} -c {shlex.quote(f"from pathlib import Path; Path({str(marker)!r}).write_text(\'workspace\')")}'
+                        script=f"from pathlib import Path; Path({str(marker)!r}).write_text('workspace')"
+                        cmd=f'{shlex.quote(sys.executable)} -c {shlex.quote(script)}'
                         (ws/'.forge'/'config.json').write_text(json.dumps({'hooks':{'user_prompt_submit':cmd,'pre_tool_use':cmd,'stop':cmd}}))
                         preview=(await member.get('/api/workspace/hook-review',params={'sid':sid})).json()
                         self.assertEqual(preview['state'],'hooks'); self.assertFalse(preview['enforcement_active'])

@@ -18,7 +18,7 @@ class CheckpointProcessCleanup(unittest.IsolatedAsyncioTestCase):
         self.script = self.root / 'child.py'
         self.ready = self.root / 'ready'
         self.marker = self.root / 'survived'
-        self.script.write_text("import pathlib,sys,time\npathlib.Path(sys.argv[1]).write_text('ready')\ntime.sleep(1.2)\npathlib.Path(sys.argv[2]).write_text('survived')\n")
+        self.script.write_text("import pathlib,sys,time\npathlib.Path(sys.argv[1]).write_text('ready')\ntime.sleep(float(sys.argv[3]))\npathlib.Path(sys.argv[2]).write_text('survived')\n")
         self.processes = []
         self.orig_spawn = asyncio.create_subprocess_exec
 
@@ -40,8 +40,8 @@ class CheckpointProcessCleanup(unittest.IsolatedAsyncioTestCase):
         while not self.ready.exists():
             await asyncio.sleep(0.01)
 
-    def command(self):
-        return [str(self.script), str(self.ready), str(self.marker)]
+    def command(self, sleep=1.2):
+        return [str(self.script), str(self.ready), str(self.marker), str(sleep)]
 
     async def test_cancellation_stops_and_reaps_real_child_for_both_helpers(self):
         for helper in ('_run', '_run_with_env'):
@@ -73,14 +73,17 @@ class CheckpointProcessCleanup(unittest.IsolatedAsyncioTestCase):
                             await asyncio.wait_for(proc.wait(), 3)
 
     async def test_timeout_stops_and_reaps_real_child(self):
+        # The child has three seconds to start and report before the timeout (0.3 s was shorter
+        # than interpreter start-up on a slow Windows machine) and would write its second file
+        # half a second after the timeout if it were left running.
         with patch.object(checkpoints, 'GIT', sys.executable), \
-             patch.object(checkpoints, 'GIT_COMMAND_TIMEOUT', 0.3, create=True), \
+             patch.object(checkpoints, 'GIT_COMMAND_TIMEOUT', 3.0, create=True), \
              patch('engine.checkpoints.asyncio.create_subprocess_exec', side_effect=self.spawn):
-            rc, out = await asyncio.wait_for(checkpoints._run_with_env(self.command(), dict(os.environ)), 3)
+            rc, out = await asyncio.wait_for(checkpoints._run_with_env(self.command(sleep=3.5), dict(os.environ)), 10)
         self.assertEqual((rc, out), (124, 'timeout'))
         self.assertTrue(self.ready.exists())
         self.assertIsNotNone(self.processes[-1].returncode)
-        await asyncio.sleep(1.3)
+        await asyncio.sleep(2.0)
         self.assertFalse(self.marker.exists())
 
     async def test_second_cancellation_does_not_cancel_cleanup(self):

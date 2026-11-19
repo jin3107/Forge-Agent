@@ -75,6 +75,7 @@ class ForegroundDeadline(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.01)
             await asyncio.wait_for(wait_cleanup(), 3)
 
+    @unittest.skipUnless(os.name == 'posix', 'outside POSIX only the shell is stopped; the command would outlive the test')
     async def test_shell_creation_timeout_and_late_cleanup(self):
         await self.check_delayed_spawn(False)
 
@@ -83,18 +84,21 @@ class ForegroundDeadline(unittest.IsolatedAsyncioTestCase):
 
     async def test_one_budget_is_shared_between_creation_and_execution(self):
         original = asyncio.create_subprocess_exec
+        # Budget 5 s, creation delayed by 2 s: the command has 3 s left to start and print, and
+        # its 4 s of work only time out if creation and execution share one budget. Restarting
+        # the budget after creation would take 7 s.
         async def delayed(*args, **kwargs):
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(2)
             return await original(*args, **kwargs)
-        argv = [sys.executable, '-u', '-c', "import time; print('partial-marker', flush=True); time.sleep(0.8)"]
+        argv = [sys.executable, '-u', '-c', "import time; print('partial-marker', flush=True); time.sleep(4)"]
         with patch('engine.tools._prepare_command', return_value=(None, argv)), \
              patch('engine.tools.asyncio.create_subprocess_exec', side_effect=delayed):
             started = time.monotonic()
-            result = await tools._run_command_result(self.ws, {'command': 'fixture', 'timeout_sec': 1})
+            result = await tools._run_command_result(self.ws, {'command': 'fixture', 'timeout_sec': 5})
             elapsed = time.monotonic() - started
         self.assertTrue(result['timed_out'], result)
         self.assertIn('partial-marker', result['output'])
-        self.assertLess(elapsed, 2.5)
+        self.assertLess(elapsed, 6.5)
 
     async def test_late_spawn_error_after_deadline_is_consumed(self):
         entered, release = asyncio.Event(), asyncio.Event()
