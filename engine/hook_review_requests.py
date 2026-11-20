@@ -1,6 +1,7 @@
 """Process-local hook review requests and admin decisions.
 
-Normal non-demo server chat consults decisions; other paths remain ungated.
+Non-demo server chat, manual compact, scheduled loop ticks and batch/battle items
+consult decisions; other paths remain ungated.
 Records are not durable or shared across workers.
 """
 from __future__ import annotations

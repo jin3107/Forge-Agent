@@ -1,5 +1,6 @@
-"""Scoped checked-hook adapter used by normal non-demo server chat.
+"""Scoped checked-hook adapter used by the checked non-demo server paths.
 
+Those are chat, manual compact, scheduled loop ticks and batch/battle items.
 Other entry points remain ungated. The caller must authenticate the owner and
 supply a trustworthy resolver. This adapter is not an OS sandbox.
 """

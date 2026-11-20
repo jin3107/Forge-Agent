@@ -1,4 +1,4 @@
-"""Checked hook adapters used in normal non-demo server chat, not all paths.
+"""Checked hook adapters used by the checked non-demo server paths, not all paths.
 
 These adapters trust their resolver and must not be used as an identity or
 isolation boundary. A returned snapshot can become stale at once.

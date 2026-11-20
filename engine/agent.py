@@ -1356,7 +1356,7 @@ async def init_agents_md(agent: "Agent") -> dict:
 
 
 async def run_batch(store: SessionStore | ScopedSessionStore, tasks: list[dict], demo: bool | None = False,
-                    router: ModelRouter | None = None, language: str = "vi"):
+                    router: ModelRouter | None = None, language: str = "vi", hook_runner_factory=None):
     """Parallel sub-agents. tasks: [{prompt, model?, title?}] (tối đa 5).
 
     Yields: task_created, task_event {index, event}, batch_done {tasks}.
@@ -1382,9 +1382,11 @@ async def run_batch(store: SessionStore | ScopedSessionStore, tasks: list[dict],
     async def pump(i: int, sid: str, prompt: str, model: str) -> None:
         ok = True
         try:
-            ag = Agent(store, sid, model=model or None, router=router)
             use_demo = demo if demo is not None else not config.has_provider_credentials(
                 llm.split_model_id(model)[0])
+            # Optional per-agent checked runner supplied by an authenticated caller (non-demo only).
+            runner = hook_runner_factory() if hook_runner_factory is not None and not use_demo else None
+            ag = Agent(store, sid, model=model or None, router=router, hook_runner=runner)
             src = send_demo(ag, prompt, language=language) if use_demo else ag.send(prompt)
             async with aclosing(src):
                 async for ev in src:
@@ -1434,7 +1436,8 @@ async def run_batch(store: SessionStore | ScopedSessionStore, tasks: list[dict],
 
 
 async def run_battle(store: SessionStore | ScopedSessionStore, prompt: str, models: list[str],
-                     demo: bool | None = False, router: ModelRouter | None = None, language: str = "vi"):
+                     demo: bool | None = False, router: ModelRouter | None = None, language: str = "vi",
+                     hook_runner_factory=None):
     """⚔ Battle: cùng 1 prompt chạy trên nhiều model song song (mỗi model 1 session + workspace)."""
     models = [m.strip() for m in models if m.strip()][:4]
     if not models:
@@ -1442,7 +1445,8 @@ async def run_battle(store: SessionStore | ScopedSessionStore, prompt: str, mode
     tasks = [{"prompt": prompt, "model": m,
               "title": f"⚔ {m.split('/')[-1]}: {prompt[:36]}"} for m in models]
     from contextlib import aclosing
-    async with aclosing(run_batch(store, tasks, demo=demo, router=router, language=language)) as batch:
+    async with aclosing(run_batch(store, tasks, demo=demo, router=router, language=language,
+                                  hook_runner_factory=hook_runner_factory)) as batch:
         async for ev in batch:
             yield ev
 

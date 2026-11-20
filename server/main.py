@@ -821,7 +821,11 @@ async def _loop_turn(sid: str, text: str, mode: str, owner_id: str, allow_mcp: b
     if not st:
         return "(phiên đã xoá)"
     demo = not config.has_provider_credentials(llm.split_model_id(st.model)[0])
-    agent = Agent(db, sid, router=model_router)
+    if demo:
+        agent = Agent(db, sid, router=model_router)
+    else:
+        # Same scoped checked runner as normal non-demo chat; the demo tick stays outside this policy.
+        agent = Agent(db, sid, router=model_router, hook_runner=_checked_hook_runner(owner_id))
     source = send_demo(agent, text) if demo else agent.send(text, chat_mode=mode)
     last = ""
     async for ev in source:
@@ -1275,8 +1279,9 @@ async def chat(sid: str, body: ChatBody, request: Request, user: User = Depends(
             if demo:
                 agent = Agent(db, sid, model=model, router=model_router)
             else:
-                # Partial enforcement: normal non-demo chat and manual compact;
-                # other server entry points remain outside this policy.
+                # Partial enforcement: normal non-demo chat, manual compact, non-demo loop
+                # ticks and batch/battle items; demo mode, synthetic requests and other
+                # server entry points remain outside this policy.
                 agent = Agent(db, sid, model=model, router=model_router,
                               hook_runner=_checked_hook_runner(user.id))
             if demo:
@@ -1345,7 +1350,8 @@ async def batch(body: BatchBody, request: Request, user: User = Depends(require_
     async def gen():
         try:
             async with aclosing(run_batch(db, [{"prompt": p, "model": batch_model} for p in prompts],
-                                          demo=demo, router=model_router, language=body.language)) as source:
+                                          demo=demo, router=model_router, language=body.language,
+                                          hook_runner_factory=lambda: _checked_hook_runner(user.id))) as source:
                 async for ev in source:
                     if await request.is_disconnected():
                         return
@@ -1376,7 +1382,8 @@ async def battle(body: BattleBody, request: Request, user: User = Depends(requir
     async def gen():
         try:
             async with aclosing(run_battle(db, prompt, battle_models, demo=None, router=model_router,
-                                           language=body.language)) as source:
+                                           language=body.language,
+                                           hook_runner_factory=lambda: _checked_hook_runner(user.id))) as source:
                 async for ev in source:
                     if await request.is_disconnected():
                         return
@@ -1575,7 +1582,7 @@ def _hook_scope_snapshot(owner_id: str, session_id: str, workspace: str):
 
 
 def _hook_scope_snapshot_with_inheritance(owner_id: str, session_id: str, workspace: str):
-    """Resolve scoped approval for normal non-demo chat; other paths remain ungated.
+    """Resolve scoped approval for the checked non-demo server paths; other paths remain ungated.
 
     The active parent comes from trusted internal lineage tracking, not a client
     claim. Explicit child review records take precedence, including denial.

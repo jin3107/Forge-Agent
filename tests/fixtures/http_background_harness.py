@@ -31,6 +31,23 @@ if os.environ.get('FORGE_TEST_HOOK_ADAPTER') == '1' and os.environ.get('FORGE_TE
     config.load_config = _fixture_load_config
 
 
+# Fixture-only clock for the process-local review registry. A test moves that clock forward
+# by writing a number of seconds to this file, instead of waiting for the real approval
+# lifetime. The registry, with its lifetime, stays the one that the server constructed.
+if os.environ.get('FORGE_TEST_HOOK_REVIEW_CLOCK_FILE'):
+    import time
+    from server import main as _review_main
+    _clock_file = Path(os.environ['FORGE_TEST_HOOK_REVIEW_CLOCK_FILE'])
+    _clock_offset = [0.0]
+    def _shifted_clock():
+        try:
+            _clock_offset[0] = float(_clock_file.read_text(encoding='ascii'))
+        except (OSError, ValueError):
+            pass  # no file yet, or read while it is being written: keep the last offset
+        return time.monotonic() + _clock_offset[0]
+    _review_main._hook_review_requests._clock = _shifted_clock
+
+
 async def fake_stream(self, messages, tools=None, model=None, temperature=0.3):
     if os.environ.get('FORGE_TEST_HOOK_ADAPTER') == '1':
         with (root/'fake-provider-calls').open('a', encoding='utf-8') as f:
