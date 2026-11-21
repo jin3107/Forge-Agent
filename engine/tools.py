@@ -6,6 +6,7 @@ import os
 import signal
 from pathlib import Path
 
+from . import proctree
 from .secrets import sanitized_env
 
 MAX_READ = 60_000          # chars returned to the model
@@ -573,11 +574,17 @@ def _signal_foreground(proc) -> bool:
             except ProcessLookupError:
                 pass
             return True  # Only the direct process was signaled, if still present.
+    # Windows: kill the whole job; cmd.exe is only the wrapper around the command.
+    delivered = proctree.terminate_windows_tree(proc)
+    if delivered is not None:
+        if delivered:
+            return False
+        logging.getLogger(__name__).warning("Foreground job termination failed; killing the direct process")
     try:
         proc.kill()
     except ProcessLookupError:
         pass
-    return False
+    return delivered is not None
 
 
 async def _cleanup_cancelled_foreground_start(spawn: asyncio.Task) -> None:
@@ -703,18 +710,17 @@ async def _run_command_reserved(workspace: Path, args: dict, override: bool, lea
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     env = sanitized_env({"TERM": "dumb", "NO_COLOR": "1"})
-    # A fresh POSIX session gives the command its own process group, so timeout
-    # cleanup cannot signal Forge's process group. Windows retains direct kill.
-    session_options = {"start_new_session": True} if os.name == "posix" else {}
+    # proctree gives the command its own POSIX session (so timeout cleanup cannot signal
+    # Forge's process group) or, on Windows, a Job Object that cleanup terminates as a whole.
     try:
         if exec_args is not None:
-            creation = asyncio.create_subprocess_exec(
+            creation = proctree.spawn_exec(
                 *exec_args, cwd=str(workspace), stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, env=env, **session_options)
+                stderr=asyncio.subprocess.STDOUT, env=env)
         else:
-            creation = asyncio.create_subprocess_shell(
+            creation = proctree.spawn_shell(
                 cmd, cwd=str(workspace), stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, env=env, **session_options)
+                stderr=asyncio.subprocess.STDOUT, env=env)
         spawn = asyncio.create_task(creation)
         try:
             # asyncio.wait does not cancel the spawn task on timeout or caller
@@ -1177,10 +1183,9 @@ async def execute_tool(name: str, args: dict, workspace: Path, override: bool = 
                 env = sanitized_env({
                     "FORGE_CHANGED_FILE": str(changed_path),
                     "FORGE_WORKSPACE": str(workspace)})
-                proc = await asyncio.create_subprocess_shell(
+                proc = await proctree.spawn_shell(
                     str(hook_cmd), cwd=str(workspace), env=env,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                    **({'start_new_session': True} if os.name == 'posix' else {}))
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
                 try:
                     capture = await asyncio.wait_for(_hooks._hook_capture_merged(proc), timeout=LEGACY_HOOK_TIMEOUT)
                     hook_out = _hooks._hook_format_output(capture, 600)
