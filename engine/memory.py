@@ -37,6 +37,8 @@ def append_entry(workspace: Path, content: str) -> str:
     if not content:
         return "Error: thiếu content"
     mem = workspace / "MEMORY.md"
+    if mem.is_symlink():
+        return "Error: MEMORY.md không được là symlink"
     try:
         old = mem.read_text(encoding="utf-8", errors="replace") if mem.exists() else ""
     except OSError:
@@ -67,7 +69,7 @@ def memory_overview(workspace: Path, data_dir: Path | None = None) -> str:
     rows: list[str] = ["🧠 Bộ nhớ đang nạp vào mỗi phiên:"]
 
     g = data_dir / "AGENTS.md"
-    if g.is_file():
+    if not g.is_symlink() and g.is_file():
         n = len(g.read_text(encoding="utf-8", errors="replace"))
         imp = _count_imports(g)
         rows.append(f"  • Quy tắc toàn cục  data/AGENTS.md — ✓ {_kb(n)}"
@@ -76,9 +78,9 @@ def memory_overview(workspace: Path, data_dir: Path | None = None) -> str:
         rows.append("  • Quy tắc toàn cục  data/AGENTS.md — chưa có")
 
     rules = next(((workspace / nm) for nm in ("AGENTS.md", "AGENTS.txt", "CLAUDE.md")
-                  if (workspace / nm).is_file()), None)
+                  if not (workspace / nm).is_symlink() and (workspace / nm).is_file()), None)
     if rules:
-        text = load_with_imports(rules)
+        text = load_with_imports(rules, root=workspace)
         n = len(text.encode("utf-8"))
         imp = _count_imports(rules)
         rows.append(f"  • Quy tắc dự án      {rules.name} — ✓ {_kb(n)}"
@@ -87,7 +89,7 @@ def memory_overview(workspace: Path, data_dir: Path | None = None) -> str:
         rows.append("  • Quy tắc dự án      AGENTS.md — chưa có (/init để sinh)")
 
     mem = workspace / "MEMORY.md"
-    if mem.is_file():
+    if not mem.is_symlink() and mem.is_file():
         entries = [ln for ln in mem.read_text(encoding="utf-8", errors="replace").splitlines()
                    if ln.strip().startswith("- [")]
         rows.append(f"  • MEMORY.md (dự án) — ✓ {_kb(len(mem.read_text(encoding='utf-8', errors='replace').encode()))} · "
@@ -99,7 +101,8 @@ def memory_overview(workspace: Path, data_dir: Path | None = None) -> str:
 
     gmem = data_dir / "MEMORY.md"
     rows.append("  • MEMORY.md (toàn cục) — " +
-                (f"✓ {_kb(len(gmem.read_text(encoding='utf-8', errors='replace').encode()))}" if gmem.is_file() else "chưa có"))
+                (f"✓ {_kb(len(gmem.read_text(encoding='utf-8', errors='replace').encode()))}"
+                 if not gmem.is_symlink() and gmem.is_file() else "chưa có"))
     rows.append("  💡 Gõ «# nội dung» → ghi nhớ nhanh · «/memory clear» → xoá MEMORY.md dự án")
     return "\n".join(rows)
 
@@ -107,10 +110,13 @@ def memory_overview(workspace: Path, data_dir: Path | None = None) -> str:
 def clear_memory(workspace: Path) -> str:
     """Xoá MEMORY.md dự án (giữ bản .bak)."""
     mem = workspace / "MEMORY.md"
+    backup = workspace / "MEMORY.md.bak"
+    if mem.is_symlink() or backup.is_symlink():
+        return "⚠ Không xoá MEMORY.md: file hoặc bản sao là symlink"
     if not mem.is_file():
         return "(chưa có MEMORY.md để xoá)"
     try:
-        (workspace / "MEMORY.md.bak").write_text(
+        backup.write_text(
             mem.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
         mem.unlink()
     except OSError as e:

@@ -2,6 +2,7 @@ import React, { useRef, useState } from 'react'
 import { api } from '../api'
 import type { FileNode } from '../types'
 import { useI18n } from '../i18n'
+import { HookReview } from './HookReview'
 
 function TreeRow(props: {
   node: FileNode
@@ -94,10 +95,18 @@ function Terminal({ sid }: { sid: string }) {
 
 export function FilesPane(props: {
   sid: string
+  isAdmin?: boolean
   tree: FileNode[]
   selected: string | null
   content: string | null
+  binary: boolean
+  missingVersion: boolean
+  mixedNewlines: boolean
   dirty: boolean
+  saving: boolean
+  deleting: boolean
+  deleted: boolean
+  locked: boolean
   onOpen: (p: string) => void
   onChange: (c: string) => void
   onSave: () => void
@@ -115,16 +124,17 @@ export function FilesPane(props: {
       <div className="files-head">
         <span>WORKSPACE</span>
         <div className="files-actions">
-          <button title={t('Tải file lên workspace', 'Upload files to workspace')} aria-label={t('Tải file lên workspace', 'Upload files to workspace')} onClick={() => uploadRef.current?.click()}>⬆</button>
+          <button title={t('Tải tối đa 20 file; file trùng tên sẽ bị bỏ qua', 'Upload up to 20 files; existing names are skipped')} aria-label={t('Tải file lên workspace', 'Upload files to workspace')} onClick={() => uploadRef.current?.click()}>⬆</button>
           <input ref={uploadRef} type="file" multiple style={{ display: 'none' }} aria-label={t('Chọn file tải lên', 'Choose files to upload')}
             onChange={(e) => { props.onUpload(e.target.files); e.currentTarget.value = '' }} />
           <button title={t('Xuất workspace (.zip)', 'Export workspace (.zip)')} aria-label={t('Xuất workspace', 'Export workspace')} onClick={props.onExport}>⤓</button>
           <button title={t('File mới', 'New file')} aria-label={t('File mới', 'New file')} onClick={props.onNewFile}>＋</button>
           <button title={t('Làm mới', 'Refresh')} aria-label={t('Làm mới workspace', 'Refresh workspace')} onClick={props.onRefresh}>⟳</button>
-          {props.selected && <button title={t('Xóa file', 'Delete file')} aria-label={t('Xóa file', 'Delete file')} onClick={props.onDelete}>🗑</button>}
+          {props.selected && <button title={props.missingVersion ? t('Cần phiên bản file để xóa an toàn', 'A file version is required for safer deletion') : t('Xóa file', 'Delete file')} aria-label={t('Xóa file', 'Delete file')} disabled={props.missingVersion || props.locked || props.saving || props.deleting} onClick={props.onDelete}>🗑</button>}
           <button className="files-close" title={t('Đóng panel Workspace', 'Close Workspace panel')} aria-label={t('Đóng panel Workspace', 'Close Workspace panel')} onClick={props.onClose}>✕</button>
         </div>
       </div>
+      <HookReview key={props.sid} sid={props.sid} isAdmin={props.isAdmin} />
       <div className="files-tree">
         {props.tree.length === 0
           ? <div className="empty">{t('Workspace trống.', 'Workspace empty.')}<br />{t('Nhờ agent tạo file nhé!', 'Ask the agent to create a file!')}</div>
@@ -139,15 +149,19 @@ export function FilesPane(props: {
             <button
               className={`btn-save ${props.dirty ? 'dirty' : ''}`}
               onClick={props.onSave}
-              disabled={!props.dirty}
-            >{props.dirty ? t('● Lưu', '● Save') : t('Đã lưu', 'Saved')}</button>
+              disabled={props.binary || props.mixedNewlines || props.missingVersion || !props.dirty || props.saving || props.deleting || props.locked}
+            >{props.binary || props.mixedNewlines || props.missingVersion ? t('Chỉ đọc', 'Read only') : props.locked ? t('Vui lòng chờ…', 'Please wait…') : props.saving ? t('Đang lưu…', 'Saving…') : props.dirty ? t('● Lưu', '● Save') : t('Đã lưu', 'Saved')}</button>
           </div>
+          {props.deleting && <div role="status">{t('Đang xóa file; tạm thời không thể lưu hoặc xóa file khác.', 'Deletion in progress; saving and other deletions are temporarily unavailable.')}</div>}
+          {props.mixedNewlines && <div role="status">{t('File có kiểu xuống dòng pha trộn; chỉ xem để tránh thay đổi dữ liệu.', 'Mixed line endings: read-only to avoid changing file data.')}</div>}
+          {props.deleted ? <div role="status">{t('File đã bị xóa; hãy sao chép bản sửa trước khi rời editor.', 'File was deleted; copy any draft before leaving the editor.')}</div> : props.missingVersion && <div role="status">{t('Không có phiên bản file hợp lệ; chỉ xem để tránh ghi đè thay đổi. Hãy kiểm tra server và mở lại.', 'No valid file version is available; read-only to avoid overwriting changes. Check the server and reopen.')}</div>}
           <textarea
             className="editor-area"
             aria-label={t(`Nội dung ${props.selected}`, `Contents of ${props.selected}`)}
             spellCheck={false}
+            readOnly={props.binary || props.mixedNewlines || props.missingVersion || props.locked}
             value={props.content ?? ''}
-            onChange={(e) => props.onChange(e.target.value)}
+            onChange={(e) => { if (!props.binary && !props.mixedNewlines && !props.missingVersion && !props.locked) props.onChange(e.target.value) }}
             placeholder={t('(file trống)', '(empty file)')}
           />
         </div>

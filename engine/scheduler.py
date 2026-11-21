@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+from .hooks import HookTrustDenied
+
 _MIN_EVERY_S = 10
 _MAX_EVERY_S = 7 * 24 * 3600
 
@@ -67,6 +69,11 @@ class LoopManager:
                     try:
                         await run_fn(sid, st["text"], st["mode"])
                         st["last_ok"] = True
+                    except HookTrustDenied as exc:
+                        st["last_ok"] = False
+                        st["last_error_code"] = "hook_trust_denied"
+                        st["last_error"] = str(exc)
+                        break
                     except Exception as e:  # noqa: BLE001 — lượt hỏng không chết loop
                         st["last_ok"] = False
                         st["last_error"] = str(e)[:200]
@@ -109,6 +116,9 @@ class LoopManager:
                "since": int(time.time() - ent["started"])}
         if not running:
             out.pop("since")
+        if ent.get("last_error_code") == "hook_trust_denied":
+            out["last_error_code"] = ent["last_error_code"]
+            out["last_error"] = ent["last_error"]
         return out
 
     def status_all(self) -> list[dict]:

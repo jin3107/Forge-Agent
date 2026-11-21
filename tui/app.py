@@ -14,7 +14,8 @@ from rich.text import Text as RichText
 
 from engine import approvals, config, tools
 from engine.agent import Agent, compact_session, init_agents_md, send_demo
-from engine.session import SessionStore
+from engine.hooks import HookTrustDenied
+from engine.session import ForkError, SessionStore
 
 store = SessionStore()
 
@@ -639,7 +640,11 @@ class ForgeTUI(App):
                 self.run_turn(text)  # @work
         elif cmd == "/fork":
             if self._require_idle():
-                ns = store.fork(self.sid)
+                try:
+                    ns = store.fork(self.sid)
+                except ForkError as exc:
+                    self.add_line(f"⚠ {exc}", cls="tool-bad")
+                    return
                 if ns:
                     self.refresh_sessions(select_latest=False)
                     self.select_session(ns.id)
@@ -695,7 +700,11 @@ class ForgeTUI(App):
         s = store.get(self.sid)
         n = len(s.messages) if s else 0
         self.add_line(f"🧹 Đang nén {n} tin nhắn…", cls="sys-line")
-        res = await compact_session(self.agent, instructions)
+        try:
+            res = await compact_session(self.agent, instructions)
+        except HookTrustDenied as denial:
+            self.add_line(f"⚠ {denial}", cls="tool-bad")
+            return
         if res.get("ok"):
             self.add_line(f"✅ Đã nén {res.get('before')} → {res.get('after')} tin nhắn "
                           f"(context nhẹ hơn hẳn)", cls="tool-ok")
@@ -726,7 +735,7 @@ class ForgeTUI(App):
             elif w_arg.startswith("discard "):
                 res = await fwt.discard(w_arg[8:].strip(), self.sid)
                 self.add_line(("🗑 " + ", ".join(res["removed"])) if res["ok"]
-                              else "(không có gì để bỏ)", cls="sys-line")
+                              else ("❌ " + res.get("message", "Không thể bỏ worktree")), cls="sys-line")
             else:
                 rows = await fwt.list_all()
                 if not rows:
@@ -873,4 +882,6 @@ class ForgeTUI(App):
 
 
 def run() -> None:
+    from engine.hooks import enable_local_hook_policy
+    enable_local_hook_policy()
     ForgeTUI().run()

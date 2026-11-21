@@ -8,11 +8,13 @@ import datetime
 import platform
 import time
 import traceback
+from contextlib import nullcontext
 from pathlib import Path
 
-from . import config, guard, llm, tools
+from . import config, guard, hook_lineage, llm, tools
 from .auditlog import log_tool, monotonic_ms
 from .llm import LLMError
+from .hooks import HookTrustDenied
 from .mcp import manager as mcp_manager
 from .models import ModelRouter
 from .session import ScopedSessionStore, Session, SessionStore
@@ -93,7 +95,7 @@ def _agents_md_block(workspace: Path) -> str:
         p = workspace / name
         if p.is_file():
             try:
-                text = load_with_imports(p)[:4000]
+                text = load_with_imports(p, root=workspace)[:4000]
                 if text.strip():
                     blocks.append(f"=== PROJECT INSTRUCTIONS ({name}) — follow strictly ===\n{text}")
                     break  # chỉ 1 file quy tắc cấp dự án (ưu tiên cao nhất)
@@ -103,7 +105,7 @@ def _agents_md_block(workspace: Path) -> str:
     try:
         g = config.DATA_DIR / "AGENTS.md"
         if g.is_file():
-            text = load_with_imports(g)[:2000]
+            text = load_with_imports(g, root=config.DATA_DIR)[:2000]
             if text.strip():
                 blocks.append(f"=== GLOBAL USER RULES (data/AGENTS.md) ===\n{text}")
     except Exception:  # noqa: S110, BLE001 — biên never-raise như auditlog
@@ -113,9 +115,55 @@ def _agents_md_block(workspace: Path) -> str:
     return "\n" + "\n\n".join(blocks) + "\n"
 
 
+class _InjectedHookRunner:
+    """Convert broken injected adapters to trust denials, never legacy fail-open."""
+    def __init__(self, runner):
+        self._runner = runner
+
+    async def _call(self, method, validator, *args, **kwargs):
+        try:
+            result = await getattr(self._runner, method)(*args, **kwargs)
+            if not validator(result):
+                raise ValueError('invalid hook runner result')
+            return result
+        except HookTrustDenied:
+            raise
+        except Exception:
+            raise HookTrustDenied() from None
+
+    async def run_event(self, *args, **kwargs):
+        return await self._call('run_event', lambda x: isinstance(x, list) and
+                                all(isinstance(e, dict) and isinstance(e.get('rc'), int) for e in x), *args, **kwargs)
+
+    async def session_start_cache(self, *args, **kwargs):
+        return await self._call('session_start_cache', lambda x: isinstance(x, str), *args, **kwargs)
+
+    async def pre_tool_use(self, *args, **kwargs):
+        return await self._call('pre_tool_use', lambda x: x is None or
+                                (isinstance(x, dict) and isinstance(x.get('blocked'), bool)), *args, **kwargs)
+
+    async def post_tool_use(self, *args, **kwargs):
+        return await self._call('post_tool_use', lambda x: isinstance(x, str), *args, **kwargs)
+
+    async def global_file_change(self, *args, **kwargs):
+        return await self._call('global_file_change', lambda x: isinstance(x, str), *args, **kwargs)
+
+
 class Agent:
     def __init__(self, store: SessionStore | ScopedSessionStore, session_id: str, model: str | None = None,
-                 depth: int = 0, router: ModelRouter | None = None):
+                 depth: int = 0, router: ModelRouter | None = None, hook_runner=None):
+        # Optional per-agent dependency; caller is responsible for its trust.
+        # Non-demo server chat injects a checked runner; other paths may not.
+        if hook_runner is not None:
+            try:
+                valid = all(callable(getattr(hook_runner, method, None)) for method in
+                            ('run_event', 'session_start_cache', 'pre_tool_use', 'post_tool_use', 'global_file_change'))
+            except Exception:
+                valid = False
+            if not valid:
+                raise ValueError('Invalid hook runner')
+        self._injected_hook_runner = hook_runner
+        self._checked_hook_runner = _InjectedHookRunner(hook_runner) if hook_runner is not None else None
         self.depth = depth
         self._bg_child = False   # A4: sub-agent nền — tắt hook user_prompt_submit/stop
         self.store = store
@@ -132,6 +180,13 @@ class Agent:
         else:
             self.model = self.session.model or config.get_model()
         self.workspace: Path = store.workspace(session_id)
+
+    def _hook_runner(self):
+        runner = getattr(self, '_checked_hook_runner', None)
+        if runner is not None:
+            return runner
+        from . import hooks
+        return hooks
 
     async def _llm_with_fallback(self, messages, tools, model):
         """stream_chat + availability fallback: 402/429/5xx → model dự phòng 1 lần.
@@ -168,6 +223,48 @@ class Agent:
             return self.router.resolve_sub_model(model, parent)
         return llm.resolve_sub_model(model, parent)
 
+    async def _prepare_subagent_worktree(self, sub_sid: str) -> str | None:
+        """Best-effort binding check, shared by foreground and background paths."""
+        from . import worktree as fwt
+        try:
+            wt = await fwt.make(self.session.id, sub_sid)
+            if not wt:
+                raise ValueError('worktree unavailable')
+            target = Path(wt).resolve(strict=True)
+            parent = Path(self.workspace).resolve(strict=True)
+            if (not target.is_dir() or target == parent or
+                    target.is_relative_to(parent) or parent.is_relative_to(target)):
+                raise ValueError('worktree overlaps parent')
+            ptr = config.WORKSPACES_DIR / f"{sub_sid}.path"
+            if ptr.is_symlink():
+                raise ValueError('invalid workspace pointer')
+            ptr.write_text(str(target), encoding="utf-8")
+            if Path(self.store.workspace(sub_sid)).resolve(strict=True) != target:
+                raise ValueError('worktree binding mismatch')
+            return str(target)
+        except HookTrustDenied:
+            raise
+        except Exception:
+            return None
+
+    def _prepare_subagent_shared(self, sub_sid: str) -> str | None:
+        """Bind a child to the parent's current workspace, or fail closed."""
+        try:
+            target = Path(self.workspace).resolve(strict=True)
+            if not target.is_dir():
+                raise ValueError('workspace unavailable')
+            ptr = config.WORKSPACES_DIR / f"{sub_sid}.path"
+            if ptr.is_symlink():
+                raise ValueError('invalid workspace pointer')
+            ptr.write_text(str(target), encoding="utf-8")
+            if Path(self.store.workspace(sub_sid)).resolve(strict=True) != target:
+                raise ValueError('shared workspace binding mismatch')
+            return str(target)
+        except HookTrustDenied:
+            raise
+        except Exception:
+            return None
+
     async def _run_subagent(self, tc_id: str, task: str, sub_model: str | None,
                             isolation: str = "shared"):
         """Chạy sub-agent: phiên mới + context hoàn toàn riêng.
@@ -175,49 +272,61 @@ class Agent:
         isolation="worktree": sub làm việc trong bản sao git-worktree từ checkpoint
         của cha (B2) — sửa/xoá không đụng workspace cha; báo cáo kèm hướng gộp/bỏ.
         """
+        if isolation not in ('shared', 'worktree'):
+            yield {"type": "subagent_output", "id": tc_id, "ok": False,
+                   "output": "Invalid sub-agent isolation; sub-agent did not start."}
+            return
         sub_sid = self.store.create(model=sub_model or self.model,
                                     title=f"\U0001F9E9 {task[:46]}").id
         iso_note = ""
+        expected_workspace = None
         if isolation == "worktree":
-            from . import worktree as fwt
-            wt = await fwt.make(self.session.id, sub_sid)
-            if wt:
-                try:
-                    ptr = config.WORKSPACES_DIR / f"{sub_sid}.path"
-                    ptr.write_text(wt, encoding="utf-8")
-                except OSError:
-                    pass
-                iso_note = wt
-            else:
-                iso_note = ""  # không có checkpoint → fallback chia sẻ (an toàn hơn fail)
-                yield {"type": "subagent_started", "id": tc_id, "session_id": sub_sid,
-                       "task": task[:200], "model": sub_model or "inherit"}
-                yield {"type": "subagent_progress", "id": tc_id, "tools": 0,
-                       "last_tool": "(worktree không khả dụng — dùng workspace chung)"}
-        if iso_note == "" and isolation != "worktree":
-            try:
-                ptr = config.WORKSPACES_DIR / f"{sub_sid}.path"
-                ptr.write_text(str(self.workspace), encoding="utf-8")
-            except OSError:
-                pass
+            iso_note = await self._prepare_subagent_worktree(sub_sid)
+            if not iso_note:
+                yield {"type": "subagent_output", "id": tc_id, "ok": False,
+                       "output": ("Worktree isolation could not be established; sub-agent did not start. "
+                                  "The child session or worktree may remain; inspect before retrying.")}
+                return
+        if isolation == 'shared':
+            expected_workspace = self._prepare_subagent_shared(sub_sid)
+            if not expected_workspace:
+                yield {"type": "subagent_output", "id": tc_id, "ok": False,
+                       "output": ("Shared workspace could not be established; sub-agent did not start. "
+                                  "The child session or pointer may remain; inspect before retrying.")}
+                return
+        else:
+            expected_workspace = iso_note
+        sub = Agent(self.store, sub_sid, model=sub_model or None, depth=self.depth + 1,
+                    router=self.router, hook_runner=getattr(self, "_injected_hook_runner", None))
+        try:
+            if Path(sub.workspace).resolve(strict=True) != Path(expected_workspace):
+                raise ValueError('child workspace changed')
+        except (OSError, ValueError, TypeError, AttributeError, RuntimeError):
+            yield {"type": "subagent_output", "id": tc_id, "ok": False,
+                   "output": ("Sub-agent workspace could not be confirmed; sub-agent did not start. "
+                              "The child session or workspace may remain; inspect before retrying.")}
+            return
         yield {"type": "subagent_started", "id": tc_id, "session_id": sub_sid,
                "task": task[:200], "model": sub_model or "inherit"}
-        sub = Agent(self.store, sub_sid, model=sub_model or None, depth=self.depth + 1,
-                    router=self.router)
         texts: list[str] = []
         n_tools = 0
         error: str | None = None
         try:
-            async for ev in sub.send(task):
-                t = ev["type"]
-                if t == "assistant_message" and ev.get("content"):
-                    texts.append(ev["content"])
-                elif t == "tool_result":
-                    n_tools += 1
-                    yield {"type": "subagent_progress", "id": tc_id, "tools": n_tools,
-                           "last_tool": ev.get("name")}
-                elif t == "error":
-                    error = ev.get("message")
+            lineage = (hook_lineage.track_shared_child(self.store, self.session.id, sub_sid, Path(expected_workspace))
+                       if isolation == 'shared' else nullcontext(False))
+            with lineage:
+                async for ev in sub.send(task):
+                    t = ev["type"]
+                    if t == "assistant_message" and ev.get("content"):
+                        texts.append(ev["content"])
+                    elif t == "tool_result":
+                        n_tools += 1
+                        yield {"type": "subagent_progress", "id": tc_id, "tools": n_tools,
+                               "last_tool": ev.get("name")}
+                    elif t == "error":
+                        error = ev.get("message")
+        except HookTrustDenied:
+            raise
         except Exception as e:  # noqa: BLE001
             error = str(e)
         summary = "\n\n".join(t for t in texts if t).strip()[-4000:] or "(subagent không trả lời)"
@@ -225,15 +334,18 @@ class Agent:
             summary = f"(subagent lỗi: {error})\n" + summary
         if isolation == "worktree" and iso_note:
             from . import worktree as fwt
-            stat = await fwt.diff_stat(sub_sid, self.session.id, iso_note)
-            diff_text = f"Diff:\n{stat}" if stat else "(không khác gì điểm rẽ nhánh)"
+            diff = await fwt.diff_stat_result(sub_sid, self.session.id, iso_note)
+            stat = diff['stat']
+            diff_text = ("(không thể xác nhận diff worktree; sub-agent có thể đã thay đổi file. Hãy kiểm tra trước khi tiếp tục.)"
+                         if not diff['ok'] else
+                         (f"Diff:\n{stat}" if stat else "(không khác gì điểm rẽ nhánh)"))
             tail = (f"\n\n📁 Cô lập worktree: {iso_note}\n{diff_text}\n"
                     f"Gộp về đây: /worktree merge {sub_sid} · Bỏ: /worktree discard {sub_sid}")
             summary = summary[:4200] + tail
         yield {"type": "subagent_done", "id": tc_id, "session_id": sub_sid,
                "tools": n_tools, "summary": summary[:300]}
         out = f"KẾT QUẢ SUB-AGENT (phiên {sub_sid}, {n_tools} tool calls):\n\n{summary}"
-        yield {"type": "subagent_output", "id": tc_id, "output": out}
+        yield {"type": "subagent_output", "id": tc_id, "output": out, "ok": error is None}
 
     async def _handle_parallel_spawns(self, s, messages, spawn_tcs, turn_state):
         """Chạy đồng thời (tối đa MAX_PARALLEL_SUBAGENTS) các spawn_subagent trong cùng
@@ -271,11 +383,13 @@ class Agent:
             else:
                 blocked = False
                 try:
-                    from . import hooks as _hooks
+                    _hooks = self._hook_runner()
                     pre = await _hooks.pre_tool_use(self.workspace, s.id, "spawn_subagent", args)
                     if pre and pre.get("blocked"):
                         blocked = True
                         reason = pre.get("reason")
+                except HookTrustDenied:
+                    raise
                 except Exception:
                     pass
                 if blocked:
@@ -293,18 +407,19 @@ class Agent:
                 batch.append((tc, args, task, resolved))
         self.store.save(s)
 
-        async def _pump(tc_id: str, task_: str, model_: str | None, q):
+        async def _pump(tc_id: str, task_: str, model_: str | None, isolation: str, q):
             try:
-                iso_ = str((_args or {}).get("isolation") or "shared")
-                async for ev in self._run_subagent(tc_id, task_, model_, iso_):
+                async for ev in self._run_subagent(tc_id, task_, model_, isolation):
                     await q.put(ev)
+            except HookTrustDenied:
+                raise
             except Exception as e:  # noqa: BLE001
-                await q.put({"type": "subagent_output", "id": tc_id,
+                await q.put({"type": "subagent_output", "id": tc_id, "ok": False,
                              "output": f"(subagent lỗi: {e})"})
             finally:
                 await q.put(None)
 
-        outputs: dict[str, str] = {}
+        outputs: dict[str, tuple[str, bool]] = {}
         for i in range(0, len(batch), MAX_PARALLEL_SUBAGENTS):
             chunk = batch[i:i + MAX_PARALLEL_SUBAGENTS]
             queues: dict[str, _aio.Queue] = {}
@@ -312,29 +427,46 @@ class Agent:
             for tc, _args, task_, model_ in chunk:
                 tc_id_ = tc["id"]
                 queues[tc_id_] = _aio.Queue()
-                pumps[_aio.create_task(_pump(tc_id_, task_, model_, queues[tc_id_]))] = tc_id_
+                isolation = str((_args or {}).get("isolation") or "shared")
+                pumps[_aio.create_task(_pump(tc_id_, task_, model_, isolation, queues[tc_id_]))] = tc_id_
             pending = set(pumps)
-            while pending:
-                done, pending = await _aio.wait(pending, return_when=_aio.FIRST_COMPLETED)
-                for pmp in done:
-                    tcid = pumps[pmp]
-                    out = None
-                    while True:
-                        ev = await queues[tcid].get()
-                        if ev is None:
-                            break
-                        if ev["type"] == "subagent_output":
-                            out = ev["output"]
-                        else:
-                            yield ev
-                    outputs[tcid] = out or "(sub-agent không trả kết quả)"
+            try:
+                while pending:
+                    done, pending = await _aio.wait(pending, return_when=_aio.FIRST_COMPLETED)
+                    # Check every finished pump before publishing successful results.
+                    for pmp in done:
+                        exc = pmp.exception()
+                        if isinstance(exc, HookTrustDenied):
+                            raise exc
+                        if exc is not None:
+                            raise exc
+                    for pmp in done:
+                        tcid = pumps[pmp]
+                        out = None
+                        ok = False
+                        while True:
+                            ev = await queues[tcid].get()
+                            if ev is None:
+                                break
+                            if ev["type"] == "subagent_output":
+                                out = ev["output"]
+                                ok = bool(ev.get("ok", out and "subagent lỗi" not in out[:20]))
+                            else:
+                                yield ev
+                        outputs[tcid] = (out or "(sub-agent không trả kết quả)", ok)
+            finally:
+                # A denial, cancellation or closed stream must not leave pumps
+                # running without an owner. Cancellation is cooperative.
+                for pmp in pumps:
+                    if not pmp.done():
+                        pmp.cancel()
+                await _aio.gather(*pumps, return_exceptions=True)
         # tool_result + messages theo thứ tự gốc của batch
         for tc, args, _task, _model in batch:
-            out = outputs.get(tc["id"], "(sub-agent không trả kết quả)")
-            log_tool(s.id, "spawn_subagent", args,
-                     bool(out and "subagent lỗi" not in out[:20]), source="subagent")
+            out, ok = outputs.get(tc["id"], ("(sub-agent không trả kết quả)", False))
+            log_tool(s.id, "spawn_subagent", args, ok, source="subagent")
             yield {"type": "tool_result", "id": tc["id"], "name": "spawn_subagent",
-                   "args": args, "ok": bool(out and "subagent lỗi" not in out[:20]),
+                   "args": args, "ok": ok,
                    "output": out}
             s.messages.append({"role": "tool", "tool_call_id": tc["id"], "content": out})
             messages.append(s.messages[-1])
@@ -343,14 +475,14 @@ class Agent:
     def _memory_block(self) -> str:
         """MEMORY.md (workspace + global) — kiến thức các phiên trước, auto-memory."""
         blocks = []
-        for label, path, cap in (
-            ("WORKSPACE MEMORY (workspace/MEMORY.md)", self.workspace / "MEMORY.md", 2000),
-            ("GLOBAL MEMORY (data/MEMORY.md)", config.DATA_DIR / "MEMORY.md", 1000),
+        for label, path, cap, root in (
+            ("WORKSPACE MEMORY (workspace/MEMORY.md)", self.workspace / "MEMORY.md", 2000, self.workspace),
+            ("GLOBAL MEMORY (data/MEMORY.md)", config.DATA_DIR / "MEMORY.md", 1000, config.DATA_DIR),
         ):
             try:
                 if path.is_file():
                     from .context_files import load_with_imports
-                    t = load_with_imports(path).strip()
+                    t = load_with_imports(path, root=root).strip()
                     if t:
                         blocks.append(f"=== {label} ===\n{t[:cap]}")
             except Exception:
@@ -392,9 +524,11 @@ class Agent:
     async def _notify(self, ntype: str, message: str, **extra) -> None:
         """C1: fire Notification hook (approval/agent_completed…). Lỗi bỏ qua."""
         try:
-            from . import hooks as _hooks
+            _hooks = self._hook_runner()
             await _hooks.run_event(self.workspace, self.session.id, "notification",
                                    {"notification_type": ntype, "message": message[:500], **extra})
+        except HookTrustDenied:
+            raise
         except Exception as _ne:  # noqa: BLE001
             print(f"[hooks] notification lỗi (bỏ qua): {_ne}")
 
@@ -405,6 +539,8 @@ class Agent:
         task = (task or "").strip()
         if not task:
             return {"ok": False, "output": "Error: thiếu task cho bg-agent"}
+        if isolation not in ('shared', 'worktree'):
+            return {"ok": False, "output": "Invalid sub-agent isolation; background sub-agent did not start."}
         running = sum(1 for v in _BG_AGENTS.values()
                       if v["lead_sid"] == self.session.id and v["status"] == "running")
         if running >= MAX_BG_AGENTS_PER_LEAD:
@@ -414,21 +550,19 @@ class Agent:
         resolved = self._resolve_sub_model(sub_model or "", self.model)
         sub_sid = self.store.create(model=resolved or self.model, title=f"🌙 {task[:46]}").id
         if isolation == "worktree":
-            from . import worktree as fwt
-            wt = await fwt.make(self.session.id, sub_sid)
-            if wt:
-                try:
-                    (config.WORKSPACES_DIR / f"{sub_sid}.path").write_text(wt, encoding="utf-8")
-                except OSError:
-                    isolation = "shared"   # không có checkpoint → fallback an toàn
-            else:
-                isolation = "shared"
+            expected_workspace = await self._prepare_subagent_worktree(sub_sid)
+        else:
+            expected_workspace = self._prepare_subagent_shared(sub_sid)
+        if not expected_workspace:
+            return {"ok": False, "output": (
+                f"{isolation.capitalize()} workspace could not be established; background sub-agent did not start. "
+                "The child session or workspace may remain; inspect before retrying.")}
         bg_id = f"bga-{_uuid.uuid4().hex[:6]}"
         _BG_AGENTS[bg_id] = {"bg_id": bg_id, "lead_sid": self.session.id, "sub_sid": sub_sid,
                              "task": task[:200], "model": resolved or "inherit",
                              "isolation": isolation, "status": "running",
                              "started": time.strftime("%H:%M:%S"), "finished": None,
-                             "tools": 0, "summary": ""}
+                             "tools": 0, "summary": "", "_expected_workspace": expected_workspace}
         import asyncio as _aio_bg
         _aio_bg.create_task(self._bg_agent_run(bg_id, sub_sid, task, resolved))
         return {"ok": True, "bg_id": bg_id, "sub_sid": sub_sid,
@@ -444,7 +578,7 @@ class Agent:
             return
         try:
             sub = Agent(self.store, sub_sid, model=sub_model or None, depth=self.depth + 1,
-                    router=self.router)
+                    router=self.router, hook_runner=getattr(self, "_injected_hook_runner", None))
         except ValueError as _ve:
             entry.update(status="error", summary=f"không tạo được phiên phụ: {_ve}",
                          finished=time.strftime("%H:%M:%S"))
@@ -454,15 +588,30 @@ class Agent:
         tools = 0
         ok = True
         try:
-            async for ev in sub.send(task, chat_mode="agent", append_user=True):
-                t = ev.get("type")
-                if t == "assistant_message":
-                    summary = ev.get("content") or summary
-                elif t == "tool_result":
-                    tools += 1
-                elif t == "error":
-                    ok = False
-                    summary = ev.get("message", "")
+            if entry.get('isolation') in ('worktree', 'shared'):
+                try:
+                    actual = Path(sub.workspace).resolve(strict=True)
+                    expected = Path(entry['_expected_workspace']).resolve(strict=True)
+                    if actual != expected:
+                        raise ValueError('workspace mismatch')
+                except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError):
+                    raise RuntimeError(f"{entry.get('isolation')} workspace binding changed; background sub-agent did not run") from None
+            lineage = (hook_lineage.track_shared_child(self.store, self.session.id, sub_sid, expected)
+                       if entry.get('isolation') == 'shared' else nullcontext(False))
+            with lineage:
+                async for ev in sub.send(task, chat_mode="agent", append_user=True):
+                    t = ev.get("type")
+                    if t == "assistant_message":
+                        summary = ev.get("content") or summary
+                    elif t == "tool_result":
+                        tools += 1
+                    elif t == "error":
+                        ok = False
+                        summary = ev.get("message", "")
+        except HookTrustDenied as exc:
+            ok = False
+            entry["error_code"] = "hook_trust_denied"
+            summary = str(exc)
         except Exception as e:  # noqa: BLE001 — nền không được làm sập tiến trình
             ok = False
             summary = f"lỗi nền: {e}"
@@ -470,14 +619,31 @@ class Agent:
         entry["finished"] = time.strftime("%H:%M:%S")
         entry["tools"] = tools
         entry["summary"] = (summary or "(không có text)")[:500]
-        fbus.send(self.session.id, sub_sid,
-                  f"🌙 bg-agent `{bg_id}` «{task[:80]}» {'XONG' if ok else 'LỖI'}: {entry['summary'][:300]}")
+        try:
+            fbus.send(self.session.id, sub_sid,
+                      f"🌙 bg-agent `{bg_id}` «{task[:80]}» {'XONG' if ok else 'LỖI'}"
+                      f"{(' [' + entry['error_code'] + ']') if entry.get('error_code') else ''}: "
+                      f"{entry['summary'][:300]}")
+        except Exception as exc:  # noqa: BLE001 — status survives failed delivery
+            entry["delivery_status"] = "failed"
+            print(f"[bg-agent] completion delivery failed: {type(exc).__name__}")
         log_tool(self.session.id, "spawn_background_agent",
                  {"bg_id": bg_id, "task": task[:80], "sub_sid": sub_sid}, ok,
                  source="background", note=f"{entry['status']} tools={tools}")
-        await self._notify("agent_completed",
-                           f"{bg_id} {entry['status']}: {entry['summary'][:200]}",
-                           bg_id=bg_id, lead_session=self.session.id)
+        try:
+            await self._notify("agent_completed",
+                               f"{bg_id} {entry['status']}: {entry['summary'][:200]}",
+                               bg_id=bg_id, lead_session=self.session.id)
+        except HookTrustDenied:
+            # Completion already happened; report the missing notification hook
+            # separately rather than claiming the completed work was undone.
+            entry["notification_status"] = "hook_trust_denied"
+            try:
+                fbus.send(self.session.id, sub_sid,
+                          f"Background agent {bg_id} notification hook trust could not be confirmed; "
+                          "completed work was not rolled back. Review workspace state.")
+            except Exception as exc:  # noqa: BLE001 — best-effort report
+                print(f"[hooks] notification warning delivery failed: {type(exc).__name__}")
 
     def bg_status(self) -> list[dict]:
         return [v for v in _BG_AGENTS.values() if v["lead_sid"] == self.session.id]
@@ -515,7 +681,7 @@ class Agent:
         # hooks C1: user_prompt_submit — exit 2 = CHẶN prompt (chuẩn Claude Code)
         if append_user and not getattr(self, "_bg_child", False):
             try:
-                from . import hooks as _hooks
+                _hooks = self._hook_runner()
                 _ups = await _hooks.run_event(self.workspace, s.id, "user_prompt_submit",
                                               {"prompt": user_text[:2000]})
                 for _r in _ups:
@@ -525,6 +691,8 @@ class Agent:
                                            + (_r["err"] or "exit 2").strip()[:200])}
                         yield {"type": "turn_end", "usage": None, "message_count": len(s.messages)}
                         return
+            except HookTrustDenied:
+                raise
             except Exception as _upe:  # noqa: BLE001
                 print(f"[hooks] user_prompt_submit lỗi (bỏ qua): {_upe}")
 
@@ -547,8 +715,10 @@ class Agent:
                    "before": cres.get("before"), "after": cres.get("after")}
         # hooks: session_start — context bổ sung (chạy 1 lần mỗi phiên mỗi tiến trình)
         try:
-            from . import hooks as _hooks
+            _hooks = self._hook_runner()
             ss_extra = await _hooks.session_start_cache(self.workspace, s.id)
+        except HookTrustDenied:
+            raise
         except Exception as _e:
             print(f"[hooks] session_start lỗi (bỏ qua): {_e}")
             ss_extra = ""
@@ -608,7 +778,11 @@ class Agent:
             yield {"type": "phase", "phase": "execute", "model": turn_model,
                    "plan_chars": len(plan_text), "usage": p_usage}
 
+        # Schema sent to the provider is not an authorization boundary: validate
+        # returned tool names again before hooks, fan-out, or execution.
+        allowed_tool_names = {sp["function"]["name"] for sp in (active_specs or [])}
         turn_state = {"spawns": 0}  # số sub-agent đã dùng trong LƯỢT này (mọi vòng lặp)
+        assistant_msg = None
         try:
             for _ in range(MAX_ITERATIONS):
                 content_parts: list[str] = []
@@ -658,7 +832,8 @@ class Agent:
                 # ---- fan-out: nhiều spawn_subagent trong CÙNG lượt → chạy song song ----
                 handled_ids: set[str] = set()
                 spawn_tcs = [tc for tc in tool_calls
-                             if tc.get("function", {}).get("name") == "spawn_subagent"] \
+                             if tc.get("function", {}).get("name") == "spawn_subagent"
+                             and "spawn_subagent" in allowed_tool_names] \
                     if chat_mode == "agent" else []
                 if len(spawn_tcs) >= 2:
                     handled_ids = {tc["id"] for tc in spawn_tcs}
@@ -670,7 +845,16 @@ class Agent:
                     if tc["id"] in handled_ids:
                         continue
                     name = tc["function"]["name"]
-                    name = tc["function"]["name"]
+                    if name not in allowed_tool_names:
+                        output = f"BLOCKED: tool '{name}' is not available in {chat_mode} mode."
+                        log_tool(s.id, name, {}, False, source="denied", note="tool not available in mode")
+                        yield {"type": "tool_result", "id": tc["id"], "name": name,
+                               "args": {}, "ok": False, "output": output}
+                        s.messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                           "content": output})
+                        messages.append(s.messages[-1])
+                        self.store.save(s)
+                        continue
                     raw_args = tc["function"].get("arguments") or "{}"
                     import json as _json
                     try:
@@ -682,7 +866,7 @@ class Agent:
 
                     # ---- hooks: pre_tool_use (exit 2 = chặn, chuẩn Claude Code) ----
                     try:
-                        from . import hooks as _hooks
+                        _hooks = self._hook_runner()
                         pre = await _hooks.pre_tool_use(self.workspace, s.id, name, args)
                         if pre and pre.get("blocked"):
                             result = {"ok": False,
@@ -695,6 +879,8 @@ class Agent:
                             messages.append(s.messages[-1])
                             self.store.save(s)
                             continue
+                    except HookTrustDenied:
+                        raise
                     except Exception as _he:
                         print(f"[hooks] pre_tool_use lỗi (bỏ qua): {_he}")
 
@@ -713,9 +899,10 @@ class Agent:
                             resolved = self._resolve_sub_model(str(args.get("model") or ""),
                                                              self.model)
                             result = {"ok": False, "output": "sub-agent không trả kết quả"}
-                            async for _sev in self._run_subagent(tc["id"], sub_task, resolved):
+                            isolation = str(args.get("isolation") or "shared")
+                            async for _sev in self._run_subagent(tc["id"], sub_task, resolved, isolation):
                                 if _sev["type"] == "subagent_output":
-                                    result = {"ok": True, "output": _sev["output"]}
+                                    result = {"ok": _sev.get("ok", True), "output": _sev["output"]}
                                 else:
                                     yield _sev
                         log_tool(s.id, name, args, bool(result.get("ok", False)),
@@ -733,15 +920,19 @@ class Agent:
 
                     # ---- interactive approval ("ask" mode) ----
                     override = False
-                    if name == "run_command":
+                    if name in ("run_command", "run_background"):
                         from . import approvals
                         mode = config.load_config().get("approval_mode", "guarded")
                         cmd = str(args.get("command", ""))
                         verdict = guard.assess_command(cmd)
+                        if mode == "ask" and cmd in self.session.allowed_commands:
+                            override = True
                         if (mode == "ask" and verdict["level"] in ("warn", "danger")
                                 and cmd not in self.session.allowed_commands):
-                            aid = approvals.create(cmd, verdict["level"], verdict["reasons"], owner_id=s.owner_id)
+                            # Notify before registering an approval so a trust
+                            # denial does not leave an unpresented pending request.
                             await self._notify("approval_request", str(cmd)[:200])
+                            aid = approvals.create(cmd, verdict["level"], verdict["reasons"], owner_id=s.owner_id)
                             yield {"type": "approval_request", "id": aid, "command": cmd,
                                    "level": verdict["level"], "reasons": verdict["reasons"]}
                             decision = await approvals.wait(aid)
@@ -774,10 +965,10 @@ class Agent:
                         _decision = "approve"
                         if (not _conn.tool_allowed(_srv.name, _tool)) and _mode != "auto":
                             _disp = f"mcp:{_srv.name}:{_tool}"
+                            await self._notify("approval_request", str(_disp)[:200])
                             aid = _ap.create(_disp, "warn",
                                              ["Tool MCP — hành động thật trên dịch vụ ngoài"],
                                              owner_id=s.owner_id)
-                            await self._notify("approval_request", str(_disp)[:200])
                             yield {"type": "approval_request", "id": aid, "command": _disp,
                                    "level": "warn",
                                    "reasons": [(f"Tool MCP chưa allowlist — "
@@ -843,6 +1034,9 @@ class Agent:
                         else:
                             result = {"ok": True, "output": "\n".join(
                                 f"{r['bg_id']} [{r['status']}] «{r['task'][:60]}» tools={r['tools']}"
+                                + (f" code={r['error_code']}" if r.get('error_code') else "")
+                                + (f" notification={r['notification_status']}" if r.get('notification_status') else "")
+                                + (f" delivery={r['delivery_status']}" if r.get('delivery_status') else "")
                                 + (f" — {r['summary'][:160]}" if r["summary"] else "")
                                 for r in _rows)}
 
@@ -874,18 +1068,31 @@ class Agent:
                             else:
                                 result = {"ok": True, "output": "(hộp thư trống)"}
                     else:
-                        result = await tools.execute_tool(name, args, self.workspace, override=override)
-                    # hooks: post_tool_use — nối nhận xét hook vào output cho LLM
-                    try:
-                        from . import hooks as _hooks
-                        extra = await _hooks.post_tool_use(self.workspace, s.id, name, args,
-                                                           str(result.get("output", "")))
-                        if extra:
-                            result["output"] = str(result.get("output", "")) + "\n" + extra
-                    except Exception as _he:
-                        print(f"[hooks] post_tool_use lỗi (bỏ qua): {_he}")
+                        legacy_kwargs = {}
+                        if (getattr(self, '_checked_hook_runner', None) is not None and
+                                name in ('write_file', 'edit_file')):
+                            legacy_kwargs['legacy_hook'] = self._hook_runner().global_file_change
+                        result = await tools.execute_tool(name, args, self.workspace, override=override,
+                                                          owner_id=s.owner_id, session_id=s.id, **legacy_kwargs)
+                    # Preserve the completed tool result if the checked legacy
+                    # hook denied after the file operation; do not run post hooks.
+                    post_trust_denial = HookTrustDenied() if result.get('hook_trust_denied') else None
+                    if post_trust_denial is None:
+                        try:
+                            _hooks = self._hook_runner()
+                            extra = await _hooks.post_tool_use(self.workspace, s.id, name, args,
+                                                               str(result.get("output", "")))
+                            if extra:
+                                result["output"] = str(result.get("output", "")) + "\n" + extra
+                        except HookTrustDenied as exc:
+                            post_trust_denial = exc
+                            result["output"] = (str(result.get("output", "")) +
+                                "\n[Post-tool hook trust was not confirmed; tool dispatch completed "
+                                "and any effects were not rolled back. Review workspace state before retrying.]")
+                        except Exception as _he:
+                            print(f"[hooks] post_tool_use lỗi (bỏ qua): {_he}")
                     # todo_write → phát event checklist cho 3 UI render tiến độ
-                    if name == "todo_write":
+                    if name == "todo_write" and post_trust_denial is None:
                         try:
                             import json as _jtodo
                             _tp = self.workspace / ".forge" / "todo.json"
@@ -897,10 +1104,29 @@ class Agent:
                              "mcp" if name in mcp_routing else "internal")
                     ev = {"type": "tool_result", "id": tc["id"], "name": name,
                           "args": args, "ok": result["ok"], "output": result["output"]}
+                    if name == "run_command":
+                        for key in ("exit_code", "timed_out", "blocked", "truncated"):
+                            if key in result:
+                                ev[key] = result[key]
+                    if "checkpoint_status" in result:
+                        ev["checkpoint_status"] = result["checkpoint_status"]
                     if result.get("diff"):
                         ev["diff"] = result["diff"]
                     if result.get("path"):
                         ev["path"] = result["path"]
+                    if post_trust_denial is not None:
+                        ev["hook_trust_denied"] = True
+                        s.messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                           "content": result["output"]})
+                        _finish_interrupted_tool_calls(s.messages, assistant_msg)
+                        try:
+                            self.store.save(s)
+                        except Exception as save_error:
+                            # Do not convert a trust denial into the ordinary
+                            # error path (which can lead to post-turn work).
+                            raise post_trust_denial from save_error
+                        yield ev
+                        raise post_trust_denial
                     yield ev
                     s.messages.append({
                         "role": "tool",
@@ -909,6 +1135,16 @@ class Agent:
                     })
                     messages.append(s.messages[-1])
                 self.store.save(s)
+        except HookTrustDenied as denial:
+            # Preserve completed results and close any unresolved tool calls in
+            # the stored transcript without claiming earlier effects were rolled back.
+            if assistant_msg is not None:
+                _finish_interrupted_tool_calls(s.messages, assistant_msg)
+            try:
+                self.store.save(s)
+            except Exception as save_error:
+                raise denial from save_error
+            raise
         except LLMError as e:
             self.store.save(s)
             yield {"type": "error", "message": str(e)}
@@ -935,16 +1171,35 @@ class Agent:
                 except Exception:
                     pass
         self.store.save(s)
-        yield {"type": "turn_end", "usage": total_usage, "session_usage": s.usage,
-               "cost_usd": cost_usd, "message_count": len(s.messages)}
         # hooks C1: stop — hết lượt (rc bỏ qua, chỉ chạy đủ vòng đời)
+        # Do not publish a normal turn end before a future trust denial.
         if not getattr(self, "_bg_child", False):
             try:
-                from . import hooks as _hooks
+                _hooks = self._hook_runner()
                 await _hooks.run_event(self.workspace, s.id, "stop",
                                        {"mode": chat_mode, "message_count": len(s.messages)})
+            except HookTrustDenied:
+                raise
             except Exception as _ste:  # noqa: BLE001
                 print(f"[hooks] stop lỗi (bỏ qua): {_ste}")
+        yield {"type": "turn_end", "usage": total_usage, "session_usage": s.usage,
+               "cost_usd": cost_usd, "message_count": len(s.messages)}
+
+
+def _finish_interrupted_tool_calls(messages: list[dict], assistant_msg: dict) -> None:
+    """Close unresolved calls after an interrupted turn without asserting rollback."""
+    position = next((i for i in range(len(messages) - 1, -1, -1)
+                     if messages[i] is assistant_msg), None)
+    if position is None:
+        return
+    done = {m.get('tool_call_id') for m in messages[position + 1:] if m.get('role') == 'tool'}
+    for call in assistant_msg.get('tool_calls') or []:
+        call_id = call.get('id')
+        if call_id and call_id not in done:
+            messages.append({'role': 'tool', 'tool_call_id': call_id,
+                             'content': 'Turn interrupted by a hook trust denial; result unavailable. '
+                                        'Earlier operations may have run; check workspace state before retrying.'})
+            done.add(call_id)
 
 
 def _accumulate(session_usage: dict, turn_usage: dict | None) -> dict:
@@ -1006,11 +1261,14 @@ async def compact_session(agent: "Agent", instructions: str = "") -> dict:
         return {"ok": False, "message": "Phiên trống — không có gì để nén"}
     before = len(s.messages)
     try:
-        from . import hooks as _hooks
+        _hooks = agent._hook_runner()
         _pc = await _hooks.run_event(agent.workspace, s.id, "pre_compact",
                                      {"before_messages": before})
         if any(r["rc"] == 2 for r in _pc):
             return {"ok": False, "message": "Nén bị hook pre_compact chặn (exit 2)"}
+    except HookTrustDenied:
+        # A trust denial must not be treated as an ordinary non-fatal hook error.
+        raise
     except Exception as _pce:  # noqa: BLE001
         print(f"[hooks] pre_compact lỗi (bỏ qua): {_pce}")
     transcript = _transcript(s.messages)
@@ -1098,12 +1356,13 @@ async def init_agents_md(agent: "Agent") -> dict:
 
 
 async def run_batch(store: SessionStore | ScopedSessionStore, tasks: list[dict], demo: bool | None = False,
-                    router: ModelRouter | None = None, language: str = "vi"):
+                    router: ModelRouter | None = None, language: str = "vi", hook_runner_factory=None):
     """Parallel sub-agents. tasks: [{prompt, model?, title?}] (tối đa 5).
 
     Yields: task_created, task_event {index, event}, batch_done {tasks}.
     """
     import asyncio as _aio
+    from contextlib import aclosing
 
     tasks = [t for t in tasks if (t.get("prompt") or "").strip()][:5]
     created = []
@@ -1121,42 +1380,75 @@ async def run_batch(store: SessionStore | ScopedSessionStore, tasks: list[dict],
     queue: _aio.Queue = _aio.Queue()
 
     async def pump(i: int, sid: str, prompt: str, model: str) -> None:
+        ok = True
         try:
-            ag = Agent(store, sid, model=model or None, router=router)
             use_demo = demo if demo is not None else not config.has_provider_credentials(
                 llm.split_model_id(model)[0])
+            # Optional per-agent checked runner supplied by an authenticated caller (non-demo only).
+            runner = hook_runner_factory() if hook_runner_factory is not None and not use_demo else None
+            ag = Agent(store, sid, model=model or None, router=router, hook_runner=runner)
             src = send_demo(ag, prompt, language=language) if use_demo else ag.send(prompt)
-            async for ev in src:
-                await queue.put((i, ev))
+            async with aclosing(src):
+                async for ev in src:
+                    if ev.get("type") == "error":
+                        ok = False
+                    await queue.put((i, ev))
+        except HookTrustDenied as exc:
+            ok = False
+            await queue.put((i, {"type": "error", "code": "hook_trust_denied", "message": str(exc)}))
+        except _aio.CancelledError:
+            ok = False
+            await queue.put((i, {"type": "error", "code": "batch_interrupted",
+                                 "message": "Batch interrupted; earlier operations may have run. "
+                                            "Check workspace state before retrying."}))
+            raise
         except Exception as e:
+            ok = False
             await queue.put((i, {"type": "error", "message": str(e)}))
         finally:
-            await queue.put((i, {"type": "task_done", "index": i, "session_id": sid}))
+            await queue.put((i, {"type": "task_done", "index": i, "session_id": sid, "ok": ok}))
 
-    runners = [_aio.create_task(pump(i, s.id, p, m)) for i, s, p, m in created]
+    runners = {i: _aio.create_task(pump(i, s.id, p, m)) for i, s, p, m in created}
     remaining = len(runners)
-    while remaining:
-        i, ev = await queue.get()
-        if ev["type"] == "task_done":
-            remaining -= 1
-        yield {"type": "task_event", "index": i, "event": ev}
-    for r in runners:
-        r.cancel()
-    yield {"type": "batch_done",
-           "tasks": [{"index": i, "session_id": s.id, "title": s.title, "model": m}
-                     for i, s, p, m in created]}
+    results: dict[int, bool] = {}
+    try:
+        # Allow each pump to start before an observed denial can cancel siblings;
+        # an unstarted coroutine cannot publish its terminal status.
+        await _aio.sleep(0)
+        while remaining:
+            i, ev = await queue.get()
+            if ev.get("type") == "error" and ev.get("code") == "hook_trust_denied":
+                for other, runner in runners.items():
+                    if other != i and not runner.done():
+                        runner.cancel()
+            if ev["type"] == "task_done":
+                remaining -= 1
+                results[i] = ev["ok"]
+            yield {"type": "task_event", "index": i, "event": ev}
+    finally:
+        for runner in runners.values():
+            if not runner.done():
+                runner.cancel()
+        await _aio.gather(*runners.values(), return_exceptions=True)
+    yield {"type": "batch_done", "ok": len(results) == len(runners) and all(results.values()),
+           "tasks": [{"index": i, "session_id": s.id, "title": s.title, "model": m,
+                      "ok": results.get(i, False)} for i, s, p, m in created]}
 
 
 async def run_battle(store: SessionStore | ScopedSessionStore, prompt: str, models: list[str],
-                     demo: bool | None = False, router: ModelRouter | None = None, language: str = "vi"):
+                     demo: bool | None = False, router: ModelRouter | None = None, language: str = "vi",
+                     hook_runner_factory=None):
     """⚔ Battle: cùng 1 prompt chạy trên nhiều model song song (mỗi model 1 session + workspace)."""
     models = [m.strip() for m in models if m.strip()][:4]
     if not models:
         models = [config.get_model()]
     tasks = [{"prompt": prompt, "model": m,
               "title": f"⚔ {m.split('/')[-1]}: {prompt[:36]}"} for m in models]
-    async for ev in run_batch(store, tasks, demo=demo, router=router, language=language):
-        yield ev
+    from contextlib import aclosing
+    async with aclosing(run_batch(store, tasks, demo=demo, router=router, language=language,
+                                  hook_runner_factory=hook_runner_factory)) as batch:
+        async for ev in batch:
+            yield ev
 
 
 # ---------------------------------------------------------------------------

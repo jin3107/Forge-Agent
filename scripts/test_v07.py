@@ -52,16 +52,19 @@ async def t1():
     await checkpoints.snapshot(checkpoints.key_for(ws), ws, "seed v1")
     (ws / "a.txt").write_text("v2-sua roi", encoding="utf-8")
     (ws / "b_moi.txt").write_text("sinh sau ck", encoding="utf-8")
-    await checkpoints.snapshot(checkpoints.key_for(ws), ws, "sua v2 + them b")
+    await checkpoints.snapshot(checkpoints.key_for(ws), ws, "truoc sua lan hai")
+    (ws / "a.txt").write_text("v3", encoding="utf-8")
     res = await checkpoints.undo(checkpoints.key_for(ws), ws)
     ok, msg = bool(res["ok"]), str(res["message"])
     assert ok, msg
-    assert (ws / "a.txt").read_text(encoding="utf-8") == "v1", "a.txt phải về v1"
-    assert not (ws / "b_moi.txt").exists(), "file sinh sau checkpoint phải bị xoá"
+    assert (ws / "a.txt").read_text(encoding="utf-8") == "v2-sua roi", "undo lần 1 phải về v2"
+    assert (ws / "b_moi.txt").exists(), "b đã tồn tại trước lần sửa thứ hai"
     res2 = await checkpoints.undo(checkpoints.key_for(ws), ws)
-    ok2, msg2 = bool(res2["ok"]), str(res2["message"])
-    assert not ok2, "undo lần 2 phải báo không còn checkpoint cha"
-    assert "không còn" in msg2.lower() or "checkpoint" in msg2.lower(), msg2
+    assert res2["ok"], res2
+    assert (ws / "a.txt").read_text(encoding="utf-8") == "v1", "undo lần 2 phải về v1"
+    assert not (ws / "b_moi.txt").exists(), "file sinh sau checkpoint đầu phải bị xoá"
+    res3 = await checkpoints.undo(checkpoints.key_for(ws), ws)
+    assert not res3["ok"], "undo lần 3 phải báo không còn checkpoint"
 
 
 @check("T2 checkpoint list trả về ít nhất 1 mốc cho workspace")

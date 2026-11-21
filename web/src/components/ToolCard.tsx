@@ -26,6 +26,10 @@ export function ToolCard({ item }: { item: Extract<Item, { kind: 'tool' }> }) {
   const [open, setOpen] = useState(hasDiff)
   const meta = TOOL_META[item.name] ?? { icon: '🔧', label: [item.name, item.name] as [string, string] }
   const running = item.output === null
+  const checkpointWarning = item.checkpointStatus === 'failed' || item.checkpointStatus === 'disabled' || item.checkpointStatus === 'unavailable'
+  const displayOutput = item.output && item.output.length > 8000
+    ? `${item.output.slice(0, 7000)}\n${t('… (đã cắt bớt phần giữa)', '… (middle truncated)')}\n${item.output.slice(-1000)}`
+    : item.output
 
   const diffLines = hasDiff
     ? (item.diff as string).split('\n').filter((l) => l.startsWith('+') && !l.startsWith('+++')).length
@@ -41,6 +45,9 @@ export function ToolCard({ item }: { item: Extract<Item, { kind: 'tool' }> }) {
         <span className="tool-label">{t(...meta.label)}</span>
         <code className="tool-arg">{argSummary(item.name, item.args)}</code>
         {hasDiff && <span className="diff-badge"><em className="d-add">+{diffLines}</em> <em className="d-del">−{delLines}</em></span>}
+        {checkpointWarning && <span className="checkpoint-warning" title={t('Không xác nhận được checkpoint mới; undo có thể không khôi phục trạng thái trước thao tác.', 'No new checkpoint was confirmed; undo may not restore the previous state.')}>
+          {t('⚠ Chưa xác nhận checkpoint', '⚠ Checkpoint not confirmed')}
+        </span>}
         <span className={`tool-status ${item.ok === false ? 'bad' : ''}`}>
           {running ? t('đang chạy…', 'running…') : item.ok ? '✓' : t('✗ lỗi', '✗ failed')}
         </span>
@@ -63,7 +70,7 @@ export function ToolCard({ item }: { item: Extract<Item, { kind: 'tool' }> }) {
           {item.output !== null && (
             <div className="tool-out">
               <div className="mini-label">{t('Kết quả', 'Result')}</div>
-              <pre>{item.output.slice(0, 8000) || t('(rỗng)', '(empty)')}</pre>
+              <pre>{displayOutput || t('(rỗng)', '(empty)')}</pre>
             </div>
           )}
         </div>

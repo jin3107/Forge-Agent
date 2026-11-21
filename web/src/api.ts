@@ -2,8 +2,41 @@ import type {
   AgentEvent, BatchEvent, ContextStats, DoctorReport, FileNode,
   KeyCheckResult, McpServerStatus, ModelInfo,
   SessionFull, SessionSummary, Settings, UsageTotals,
-  AuditEntry, ConnectorPreset, SkillInfo,
+  AuditEntry, CheckpointStatus, ConnectorPreset, SkillInfo,
 } from './types'
+
+export interface WorkspaceHookReview {
+  workspace: string
+  state: 'absent' | 'no_hooks' | 'hooks' | 'invalid'
+  digest: string | null
+  hooks: unknown
+  on_file_change: unknown
+  overrides_global_hooks: boolean | null
+  enforcement_active: boolean
+}
+
+export interface HookReviewRequestRow {
+  request_id: string
+  owner_id: string
+  session_id: string
+  workspace: string
+  digest: string
+  status: 'pending' | 'approved' | 'denied'
+  snapshot_revalidated: boolean
+}
+
+export interface AdminHookReview {
+  request_id: string
+  owner_id: string
+  session_id: string
+  workspace: string
+  digest: string
+  status: 'pending' | 'approved' | 'denied'
+  hooks: unknown
+  on_file_change: unknown
+  overrides_global_hooks: boolean
+  enforcement_active: boolean
+}
 
 let csrfToken = ''
 
@@ -110,7 +143,7 @@ async function responseError(res: Response): Promise<Error> {
     detail = raw
   }
   detail = redactErrorText(detail).replace(/\s+/g, ' ').trim().slice(0, 1000)
-  return new Error(detail ? `${prefix} — ${detail}` : `${prefix} — Server không trả nội dung lỗi.`)
+  return Object.assign(new Error(detail ? `${prefix} — ${detail}` : `${prefix} — Server không trả nội dung lỗi.`), { status: res.status })
 }
 
 async function j<T>(res: Response): Promise<T> {
@@ -241,20 +274,27 @@ export const api = {
 
   readFile: (sid: string, path: string) =>
     req(`/api/workspace/file?sid=${encodeURIComponent(sid)}&path=${encodeURIComponent(path)}`).then((r) =>
-      j<{ path: string; binary: boolean; content: string }>(r),
+      j<{ path: string; binary: boolean; content: string; version?: string }>(r),
     ),
 
-  saveFile: (sid: string, path: string, content: string) =>
-    req(`/api/workspace/file?sid=${encodeURIComponent(sid)}`, {
+  saveFile: (sid: string, path: string, content: string, expectedVersion: string) =>
+    req(`/api/workspace/file/conditional?sid=${encodeURIComponent(sid)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path, content }),
-    }).then((r) => j<{ ok: boolean }>(r)),
+      body: JSON.stringify({ path, content, expected_version: expectedVersion }),
+    }).then((r) => j<{ ok: boolean; version?: string; checkpoint_status?: CheckpointStatus; warning?: string; notice?: string }>(r)),
 
-  deleteFile: (sid: string, path: string) =>
-    req(`/api/workspace/file?sid=${encodeURIComponent(sid)}&path=${encodeURIComponent(path)}`, {
+  createFile: (sid: string, path: string) =>
+    req(`/api/workspace/file?sid=${encodeURIComponent(sid)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path, content: '' }),
+    }).then((r) => j<{ ok: boolean; checkpoint_status?: CheckpointStatus; warning?: string; notice?: string }>(r)),
+
+  deleteFile: (sid: string, path: string, expectedVersion: string) =>
+    req(`/api/workspace/file/conditional?sid=${encodeURIComponent(sid)}&path=${encodeURIComponent(path)}&expected_version=${encodeURIComponent(expectedVersion)}`, {
       method: 'DELETE',
-    }).then((r) => j<{ ok: boolean }>(r)),
+    }).then((r) => j<{ ok: boolean; checkpoint_status?: CheckpointStatus; warning?: string; notice?: string }>(r)),
 
   /** POST chat and stream SSE events (proxy-safe, abortable). images = data URIs. */
   streamChat: (sid: string, text: string, mode: string, onEvent: (ev: AgentEvent) => void, signal: AbortSignal, images?: string[], rerun?: boolean, model?: string, language?: string) =>
@@ -320,13 +360,32 @@ export const api = {
   battleStream: (prompt: string, models: string[], onEvent: (ev: BatchEvent) => void, signal: AbortSignal, language?: string) =>
     sseRequest<BatchEvent>('/api/battle', { prompt, models, language }, onEvent, signal),
 
+  /** Read-only snapshot; this does not approve or block hooks. */
+  reviewWorkspaceHooks: (sid: string) =>
+    req(`/api/workspace/hook-review?sid=${encodeURIComponent(sid)}`).then((r) => j<WorkspaceHookReview>(r)),
+
+  requestHookReview: (sid: string, workspace: string, digest: string) =>
+    req('/api/workspace/hook-review-requests', {method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({sid, expected_workspace:workspace, expected_digest:digest, share_commands:true})})
+      .then((r) => j<{request_id:string; enforcement_active:boolean}>(r)),
+  listHookReviewRequests: () => req('/api/workspace/hook-review-requests')
+    .then((r) => j<{requests:HookReviewRequestRow[]; enforcement_active:boolean}>(r)),
+  revokeHookReviewRequest: (id: string) => req(`/api/workspace/hook-review-requests/${encodeURIComponent(id)}`, {method:'DELETE'})
+    .then((r) => j<{ok:boolean; enforcement_active:boolean}>(r)),
+  getHookReviewRequest: (id: string) => req(`/api/workspace/hook-review-requests/${encodeURIComponent(id)}`)
+    .then((r) => j<AdminHookReview>(r)),
+  decideHookReviewRequest: (id: string, decision: 'approve'|'deny', workspace: string, digest: string) =>
+    req(`/api/workspace/hook-review-requests/${encodeURIComponent(id)}/decision`, {method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({decision,expected_workspace:workspace,expected_digest:digest})})
+      .then((r) => j<{request_id:string; status:'approved'|'denied'; enforcement_active:boolean}>(r)),
+
   /** Terminal tích hợp: chạy lệnh trong workspace. */
   exec: (sid: string, command: string) =>
     req(`/api/workspace/exec?sid=${encodeURIComponent(sid)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ command }),
-    }).then((r) => j<{ blocked: boolean; ok?: boolean; output: string }>(r)),
+    }).then((r) => j<{ blocked: boolean; ok?: boolean; output: string; checkpoint_status?: CheckpointStatus }>(r)),
 
   /** Mở thư mục dự án thật làm workspace (cần FORGE_ALLOW_OPEN=1). */
   openWorkspace: (sid: string, path: string) =>
@@ -364,7 +423,7 @@ export const api = {
     return req(`/api/workspace/upload?sid=${encodeURIComponent(sid)}`, {
       method: 'POST',
       body: fd,
-    }).then((r) => j<{ saved: string[]; skipped: string[] }>(r))
+    }).then((r) => j<{ saved: string[]; skipped: string[]; checkpoint_status?: CheckpointStatus; warning?: string; notice?: string }>(r))
   },
 
   exportUrl: (sid: string) => `/api/workspace/export?sid=${encodeURIComponent(sid)}`,

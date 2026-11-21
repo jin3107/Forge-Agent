@@ -289,6 +289,8 @@ async def t5():
             return 0, "tree-fake"
         if "commit-tree" in args:
             return 0, "c" * 40
+        if "show-ref" in args:
+            return 1, ""  # first snapshot: checkpoint ref is absent
         if "rev-parse" in args and "refs/heads/forge" in args:
             return 1, ""
         return 0, "true"
@@ -298,12 +300,12 @@ async def t5():
         result = await cp.snapshot("sid-v033", ws, "test")
         assert result == "c" * 10, result
 
-        async def fake_undo_run(args, env):
+        async def fake_undo_run(args, env, **kwargs):
             calls.append((args, dict(env)))
             if "rev-parse" in args and args[-1] == "refs/heads/forge":
                 return 0, "a" * 40
-            if "rev-parse" in args and args[-1] == "a" * 40 + "^":
-                return 0, "b" * 40
+            if "rev-list" in args:
+                return 0, "a" * 40 + " " + "b" * 40
             if "log" in args:
                 return 0, "fake-log"
             return 0, ""

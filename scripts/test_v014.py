@@ -78,7 +78,7 @@ async def t2():
     r = await execute_tool("run_background", {"command":
         "echo OUTMARK\"4\"2; sleep 1.2; echo TAILMARK\"9\"9; sleep 1.5"}, TMP)
     assert r["ok"], r
-    m = re.search(r"\[(bg-[0-9a-f]{6})\]", r["output"])
+    m = re.search(r"\[(bg-[0-9a-f]{32})\]", r["output"])
     assert m, r["output"][:120]
     tid = m.group(1)
 
@@ -125,7 +125,7 @@ async def t2():
     assert "✅ xong" in c3b["output"], c3b
     # kill
     r2 = await execute_tool("run_background", {"command": "sleep 30"}, TMP)
-    tid2 = re.search(r"\[(bg-[0-9a-f]{6})\]", r2["output"]).group(1)
+    tid2 = re.search(r"\[(bg-[0-9a-f]{32})\]", r2["output"]).group(1)
     k = await execute_tool("kill_background", {"id": tid2}, TMP)
     assert "kill" in k["output"].lower() or "🛑" in k["output"], k
     # guard: lệnh danger ở chế độ guarded bị chặn

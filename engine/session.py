@@ -36,16 +36,37 @@ class Session:
         )
 
 
+def _valid_session_id(sid: object) -> bool:
+    """Accept only exact safe session identifiers; never normalize an ACL key."""
+    if not isinstance(sid, str) or not sid or len(sid) > 200:
+        return False
+    try:
+        return len(sid.encode('utf-8')) <= 240 and all(c.isalnum() or c in '-_' for c in sid)
+    except UnicodeEncodeError:
+        return False
+
+
+class ForkError(RuntimeError):
+    """Fork did not complete; newly created artifacts may still exist."""
+
+    def __init__(self, child_sid: str):
+        self.child_sid = child_sid
+        super().__init__(f"Fork failed; child session {child_sid} or partial workspace may remain. Inspect before retrying.")
+
+
 class SessionStore:
     def __init__(self) -> None:
         config.ensure_dirs()
 
     # -- paths --------------------------------------------------------------
     def _path(self, sid: str) -> Path:
-        safe = "".join(c for c in sid if c.isalnum() or c in "-_")
-        return config.SESSIONS_DIR / f"{safe}.json"
+        if not _valid_session_id(sid):
+            raise ValueError('Invalid session ID')
+        return config.SESSIONS_DIR / f"{sid}.json"
 
     def workspace(self, sid: str) -> Path:
+        if not _valid_session_id(sid):
+            raise ValueError('Invalid session ID')
         # Nếu phiên được "mở" vào một dự án thật (pointer file), dùng thư mục đó.
         ptr = config.WORKSPACES_DIR / f"{sid}.path"
         if ptr.exists():
@@ -61,6 +82,8 @@ class SessionStore:
 
     def open_workspace(self, sid: str, path: str) -> Path:
         """Trỏ workspace của phiên tới một thư mục có thật (project thật)."""
+        if not _valid_session_id(sid):
+            raise ValueError('Invalid session ID')
         target = Path(path).expanduser().resolve()
         if not target.is_dir():
             raise ValueError(f"Thư mục không tồn tại: {path}")
@@ -70,6 +93,8 @@ class SessionStore:
         return target
 
     def close_workspace(self, sid: str) -> None:
+        if not _valid_session_id(sid):
+            raise ValueError('Invalid session ID')
         ptr = config.WORKSPACES_DIR / f"{sid}.path"
         if ptr.exists():
             ptr.unlink()
@@ -97,39 +122,52 @@ class SessionStore:
         ns.messages = copy.deepcopy(src.messages)
         ns.allowed_commands = list(src.allowed_commands)
         self.save(ns)
-        # workspace
-        ptr = config.WORKSPACES_DIR / f"{sid}.path"
-        if ptr.exists():  # phiên trỏ tới dự án thật → fork trỏ chung
-            try:
-                (config.WORKSPACES_DIR / f"{ns.id}.path").write_text(
-                    ptr.read_text(encoding="utf-8"), encoding="utf-8")
-                return ns
-            except OSError:
-                pass
-        src_ws = self.workspace(sid)
-        dst_ws = config.WORKSPACES_DIR / ns.id
+        # A known snapshot export failure must not silently switch the fork to
+        # live files. Failure can leave the new session or partial workspace.
         try:
-            from . import worktree as fwt
-            if fwt.export_tree_sync(sid, dst_ws):  # B2: fork từ snapshot (nhanh, nhất quán)
+            ptr = config.WORKSPACES_DIR / f"{sid}.path"
+            if ptr.is_symlink():
+                raise ValueError('invalid workspace pointer')
+            if ptr.exists():
+                target = ptr.read_text(encoding="utf-8")
+                with (config.WORKSPACES_DIR / f"{ns.id}.path").open('x', encoding='utf-8') as child_ptr:
+                    child_ptr.write(target)
                 return ns
-        except Exception:  # noqa: BLE001 — archive lỗi → copytree như cũ
-            pass
-        if src_ws.exists():
-            shutil.copytree(
-                src_ws, dst_ws,
-                ignore=shutil.ignore_patterns(
-                    "node_modules", ".git", ".venv", "venv", "__pycache__",
-                    "dist", "build", "target", ".next", ".cache"),
-                dirs_exist_ok=True)
-        return ns
+            src_ws = self.workspace(sid)
+            dst_ws = config.WORKSPACES_DIR / ns.id
+            if dst_ws.exists() or dst_ws.is_symlink():
+                raise ValueError('fork workspace already exists')
+            from . import worktree as fwt
+            repo = fwt._repo(sid)
+            try:
+                repo.lstat()
+                repo_exists = True
+            except FileNotFoundError:
+                repo_exists = False
+            if repo_exists:
+                if repo.is_symlink() or not repo.is_dir() or not fwt.export_tree_sync(sid, dst_ws):
+                    raise ValueError('snapshot export failed')
+                return ns
+            if src_ws.exists():
+                shutil.copytree(
+                    src_ws, dst_ws,
+                    ignore=shutil.ignore_patterns(
+                        "node_modules", ".git", ".venv", "venv", "__pycache__",
+                        "dist", "build", "target", ".next", ".cache"))
+            return ns
+        except Exception as exc:
+            raise ForkError(ns.id) from exc
 
 
     def get(self, sid: str) -> Session | None:
+        if not _valid_session_id(sid):
+            return None
         p = self._path(sid)
         if not p.exists():
             return None
         try:
-            return Session.from_dict(json.loads(p.read_text(encoding="utf-8")))
+            session = Session.from_dict(json.loads(p.read_text(encoding="utf-8")))
+            return session if session.id == sid else None
         except Exception:
             return None
 
@@ -176,6 +214,8 @@ class SessionStore:
         os.replace(tmp, self._path(s.id))
 
     def delete(self, sid: str) -> bool:
+        if not _valid_session_id(sid):
+            return False
         p = self._path(sid)
         if p.exists():
             p.unlink()

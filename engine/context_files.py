@@ -3,7 +3,8 @@
 
 Quy tắc (theo research v0.12):
 - Dòng văn xuôi chứa ``@path/to/file`` → thay bằng nội dung file đó.
-- Đường dẫn tương đối với THƯ MỤC FILE CHỨA; hỗ trợ ~ và đường dẫn tuyệt đối.
+- Đường dẫn tương đối với thư mục file chứa; chỉ nạp file bên trong root cho phép.
+- Mặc định root là thư mục của file đầu tiên; caller có thể chỉ định workspace/data root.
 - Đệ quy tối đa 5 tầng; chống vòng lặp (mỗi file nạp 1 lần mỗi nhánh).
 - KHÔNG import bên trong code block ``` và inline `code span`.
 - Chỉ import khi file TỒN TẠI — nếu không, giữ nguyên chữ (không mất thông tin).
@@ -30,23 +31,26 @@ def _resolve(token: str, base_dir: Path) -> Path | None:
         p = base_dir / p
     try:
         return p.resolve() if p.exists() else None
-    except OSError:
+    except (OSError, RuntimeError):
         return None
 
 
-def _expand_outside(text: str, base_dir: Path, depth: int, seen: frozenset) -> str:
+def _expand_outside(text: str, base_dir: Path, depth: int, seen: frozenset,
+                    root: Path) -> str:
     """Xử lý 1 đoạn NGOÀI code span: thay @token bằng nội dung file (nếu có)."""
 
     def sub(m: re.Match) -> str:
         target = _resolve(m.group(1), base_dir)
         if target is None:
             return m.group(0)  # file không tồn tại → giữ nguyên
-        return load_with_imports(target, depth=depth + 1, _seen=seen)
+        if not target.is_relative_to(root):
+            return "[@import blocked: outside allowed root]"
+        return load_with_imports(target, depth=depth + 1, _seen=seen, root=root)
 
     return IMPORT_RE.sub(sub, text)
 
 
-def _process_line(line: str, base_dir: Path, depth: int, seen: frozenset) -> str:
+def _process_line(line: str, base_dir: Path, depth: int, seen: frozenset, root: Path) -> str:
     """Xử lý 1 dòng: bỏ qua phần nằm trong `inline code span`."""
     parts = line.split("`")
     out: list[str] = []
@@ -55,24 +59,29 @@ def _process_line(line: str, base_dir: Path, depth: int, seen: frozenset) -> str
             if depth >= MAX_DEPTH:
                 out.append(seg)
             else:
-                out.append(_expand_outside(seg, base_dir, depth, seen))
+                out.append(_expand_outside(seg, base_dir, depth, seen, root))
         else:
             out.append(seg)
     return "`".join(out)
 
 
 def load_with_imports(path: Path, depth: int = 0,
-                      _seen: frozenset | None = None) -> str:
-    """Đọc file md, nội suy @import (đệ quy). File không đọc được → chuỗi rỗng."""
+                      _seen: frozenset | None = None, *, root: Path | None = None) -> str:
+    """Load a context file and imports confined to the caller's allowed root."""
+    path = Path(path)
     seen = _seen if _seen is not None else frozenset()
     try:
-        rp = str(path.resolve())
-    except OSError:
+        allowed_root = Path(root if root is not None else path.parent).resolve()
+        resolved = path.resolve()
+        if not resolved.is_relative_to(allowed_root):
+            return ""
+        rp = str(resolved)
+    except (OSError, RuntimeError):
         return ""
     if rp in seen:  # vòng lặp → bỏ
         return "[@import bị bỏ qua: vòng lặp]"
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        raw = resolved.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
     if depth >= MAX_DEPTH:
@@ -86,7 +95,7 @@ def load_with_imports(path: Path, depth: int = 0,
             in_fence = not in_fence
             out_lines.append(line)
             continue
-        out_lines.append(line if in_fence else _process_line(line, base_dir, depth, child_seen))
+        out_lines.append(line if in_fence else _process_line(line, base_dir, depth, child_seen, allowed_root))
     text = "\n".join(out_lines)
     if len(text.encode("utf-8")) > PER_IMPORT_CAP and depth > 0:
         data = text.encode("utf-8")[:PER_IMPORT_CAP]

@@ -5,8 +5,8 @@ Modes (stored in config as "approval_mode"):
                         to the model/user.
   "auto" (yolo)       — everything runs (only for trusted/private use).
 
-If Docker is available AND env FORGE_DOCKER_SANDBOX=1, commands run inside a
-locked-down container instead (no network, read-only fs except /work).
+When config docker_sandbox is enabled, shell-tool execution uses Docker and
+fails closed if Docker is unavailable. Other subprocess types are not covered.
 """
 import re
 import shutil
@@ -104,6 +104,15 @@ def guard_message(cmd: str, verdict: dict) -> str:
         "và đề nghị họ chạy lại ở chế độ 'auto' (YOLO) trong Settings nếu họ chấp nhận rủi ro. "
         f"Lệnh bị chặn: {cmd[:300]}"
     )
+
+
+def docker_command(cmd: str, workspace, image: str = "python:3.12-slim") -> list[str]:
+    """Build Docker argv without interpolating workspace or command into a host shell."""
+    from pathlib import Path
+    return ["docker", "run", "--rm", "-i", "--network=none", "--pids-limit=256",
+            "--memory=512m", "--cpus=1", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev", "-v",
+            f"{Path(workspace).resolve()}:/work", "-w", "/work", image, "sh", "-c", cmd]
 
 
 def docker_wrap(cmd: str, image: str = "python:3.12-slim") -> str:

@@ -15,6 +15,8 @@ import secrets
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -70,12 +72,18 @@ class AuthStore:
         self._lock = threading.RLock()
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=5000")
+            # SQLite's connection context commits/rolls back but does not close.
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._lock, self._connect() as db:
