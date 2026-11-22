@@ -121,6 +121,7 @@ class ServerEntryPoints(unittest.IsolatedAsyncioTestCase):
         with patch.object(main, 'ScopedSessionStore', return_value=scoped), \
                 patch.object(main, 'Agent', side_effect=build), \
                 patch.object(main, 'send_demo', turn), \
+                patch.object(main, '_loop_owner_denial', return_value=None), \
                 patch.object(main.config, 'has_provider_credentials', return_value=credentials):
             answer = await main._loop_runner('owner-1', False)('s', 'work', 'agent')
         self.assertEqual(answer, 'answer')
