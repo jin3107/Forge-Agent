@@ -60,11 +60,21 @@ class Fixture:
 
     def force_stop(self):
         # Safety net so a failing test cannot leave a 40 s grandchild behind.
+        # Match the full path of this fixture's script (in a fresh temporary folder) and leave out the
+        # PowerShell process that runs the query, whose own command line contains that path.
         import subprocess
+        path = str(self.grandchild).replace("'", "''")
         subprocess.run(["powershell", "-NoProfile", "-Command",
-                        "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like '*"
-                        f"{self.grandchild.name}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"],
+                        "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and "
+                        f"$_.CommandLine -and $_.CommandLine.Contains('{path}') }} | "
+                        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
                        capture_output=True)
+
+    def require_started(self):
+        # A stop after a fixed deadline can come before both interpreters have started; then there
+        # is nothing to observe, which is not a product failure.
+        if not self.beat.exists():
+            raise unittest.SkipTest("the grandchild had not started when the deadline passed")
 
 
 @unittest.skipUnless(WINDOWS, "Job Objects are Windows-only")
@@ -117,6 +127,7 @@ class WindowsTreeStop(unittest.IsolatedAsyncioTestCase):
         result = await tools._run_command_result(self.ws, {"command": self.fx.command, "timeout_sec": 2})
         self.assertTrue(result["timed_out"], result)
         self.assertLess(time.monotonic() - started, 8)
+        self.fx.require_started()
         await self.fx.assert_beat_stops()
 
     async def test_foreground_cancel_stops_the_grandchild(self):
@@ -132,6 +143,7 @@ class WindowsTreeStop(unittest.IsolatedAsyncioTestCase):
             result = await hooks._run_cmd(self.fx.command, {}, self.ws)
         self.assertEqual(result["code"], 1, result)
         self.assertIn("timeout", result["err"])
+        self.fx.require_started()
         await self.fx.assert_beat_stops()
 
     async def test_command_that_exits_on_its_own_keeps_detached_children(self):
@@ -156,6 +168,26 @@ class WindowsTreeStop(unittest.IsolatedAsyncioTestCase):
         # The suspended command was killed, so the grandchild never started.
         await asyncio.sleep(0.5)
         self.assertFalse(self.fx.beat.exists())
+
+    async def test_unexpected_error_while_containing_does_not_leave_the_command_running(self):
+        # A command that was never resumed cannot write a heartbeat, so look at the process itself.
+        processes = []
+        original = asyncio.create_subprocess_shell
+
+        async def spawn(*args, **kwargs):
+            proc = await original(*args, **kwargs)
+            processes.append(proc)
+            return proc
+
+        with patch.object(proctree.asyncio, "create_subprocess_shell", side_effect=spawn),                 patch.object(proctree, "adopt", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                await proctree.spawn_shell(self.fx.command, cwd=str(self.dir),
+                                           stdout=asyncio.subprocess.PIPE)
+        try:
+            await asyncio.wait_for(processes[0].wait(), 5)  # killed, not left suspended
+        finally:
+            if processes[0].returncode is None:
+                processes[0].kill()
 
 
 class PortableSpawnOptions(unittest.TestCase):
