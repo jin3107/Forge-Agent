@@ -53,6 +53,37 @@ def _repo_dir(sid: str):
     return config.WORKSPACES_DIR / f".ckpt-{sid}.git"
 
 
+# Git applies content conversions (core.autocrlf, .gitattributes eol/text/filter/ident,
+# working-tree-encoding, export-ignore/export-subst) on add, checkout and archive. A snapshot
+# must be byte-exact, so the checkpoint repository switches every one of them off. The
+# repository's own info/attributes has the highest precedence: it overrides the workspace's
+# .gitattributes and the user's and system's attribute files.
+EXACT_ATTRIBUTES = "* -text -filter -ident -working-tree-encoding -export-ignore -export-subst\n"
+
+
+def ensure_exact_attributes(repo) -> bool:
+    """Make sure ``<repo>/info/attributes`` disables conversions; False if it cannot be written.
+
+    Checked on every use, so repositories created before this rule are fixed as well. Snapshots
+    they already hold were stored converted and are restored as stored.
+    """
+    try:
+        # Never create a repository directory (or a stray tree in the cwd) just for this file.
+        if not Path(repo).is_dir():
+            return False
+        target = Path(repo) / "info" / "attributes"
+        try:
+            if target.read_text(encoding="utf-8") == EXACT_ATTRIBUTES:
+                return True
+        except FileNotFoundError:
+            pass
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(EXACT_ATTRIBUTES, encoding="utf-8", newline="\n")
+        return True
+    except (OSError, UnicodeError):
+        return False
+
+
 def _git_args(sid: str, workspace) -> list[str]:
     return ["--git-dir", str(_repo_dir(sid)), "--work-tree", str(workspace)]
 
@@ -223,6 +254,9 @@ async def snapshot(sid: str, workspace, label: str, *, on_detached_cleanup=None,
             rc, _ = await run(*step)
             if rc != 0:
                 return None
+    # Fail closed: a snapshot taken with conversions active cannot be restored byte-exact.
+    if not ensure_exact_attributes(repo):
+        return None
 
     pathspec = ["--", "."] + [f":(exclude){e}" for e in EXCLUDES]
     rc, _ = await run("add", "-A", *pathspec)
@@ -273,6 +307,8 @@ async def undo(sid: str, workspace) -> dict:
     rc, cur = await _run_with_env(base + ["rev-parse", "refs/heads/forge"], env)
     if rc != 0:
         return {"ok": False, "message": "Chưa có checkpoint nào để undo"}
+    if not ensure_exact_attributes(repo):
+        return {"ok": False, "message": "Không thể tắt chuyển đổi nội dung của Git cho checkpoint; undo chưa được thực hiện."}
     cur = cur.strip()
     if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", cur):
         return {"ok": False, "message": "Không thể xác nhận checkpoint hiện tại; undo chưa được thực hiện."}
