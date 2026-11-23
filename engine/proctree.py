@@ -26,6 +26,10 @@ IS_WINDOWS = sys.platform == "win32"
 
 # Only Windows needs a creationflags value; it is passed to the asyncio spawn helpers.
 _CREATE_SUSPENDED = 0x00000004
+# The new process group is the counterpart of ``start_new_session`` on POSIX: the command gets its
+# own group. It is not needed for the job itself, and Microsoft documents that it disables Ctrl+C
+# for the processes of the group, so a console Ctrl+C no longer reaches the command; a stop
+# request goes through the job instead.
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
@@ -96,19 +100,8 @@ class ProcessTree:
         except (AttributeError, OSError):
             return False
 
-    def wait_gone(self, timeout: float = 5.0) -> bool:
-        """Poll until no process of the tree is alive. False means still running or unknown."""
-        deadline = time.monotonic() + timeout
-        while True:
-            n = self.active_count()
-            if n == 0:
-                return True
-            if n is None or time.monotonic() >= deadline:
-                return False
-            time.sleep(0.02)
-
     async def confirm_gone(self, timeout: float = 5.0) -> bool:
-        """Async form of :meth:`wait_gone` that does not block the event loop."""
+        """Poll until no process of the tree is alive. False means still running or unknown."""
         deadline = time.monotonic() + timeout
         while True:
             n = self.active_count()
@@ -151,6 +144,8 @@ def adopt(proc) -> ProcessTree | None:
             raise OSError(ctypes.get_last_error(), "OpenProcess failed")
         if not _k32.AssignProcessToJobObject(job, handle):
             raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        # NtResumeProcess is an undocumented ntdll function. ResumeThread cannot be used because
+        # subprocess closes the handle of the primary thread right after the start.
         if _ntdll.NtResumeProcess(handle) != 0:
             raise OSError("NtResumeProcess failed")
         tree = ProcessTree(proc.pid, job)
@@ -178,15 +173,23 @@ def tree_of(proc) -> ProcessTree | None:
     return tree if isinstance(tree, ProcessTree) and tree._job else None
 
 
+def _kill_quietly(proc) -> None:
+    try:
+        proc.kill()
+    except (OSError, ProcessLookupError):
+        pass
+
+
 def _attach(proc) -> None:
     if not IS_WINDOWS or not isinstance(proc, asyncio.subprocess.Process):
         return  # not a process this module started (e.g. a test double): nothing to contain
-    tree = adopt(proc)
+    try:
+        tree = adopt(proc)
+    except BaseException:
+        _kill_quietly(proc)  # never leave a suspended command behind, whatever went wrong
+        raise
     if tree is None:
-        try:
-            proc.kill()  # adopt() already did; this guards any caller that returns None
-        except (OSError, ProcessLookupError):
-            pass
+        _kill_quietly(proc)  # adopt() already did; this guards any caller that returns None
         raise OSError("could not contain the command in a job object")
     proc._forge_tree = tree
 
