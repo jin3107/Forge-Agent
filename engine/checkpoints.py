@@ -67,7 +67,7 @@ LEGACY_NOTE = ("Lưu ý: checkpoint này được tạo trước khi checkpoint 
                "đã đổi line ending (CRLF→LF) của một số file khi lưu; đã khôi phục đúng như đã lưu.")
 
 
-def ensure_exact_attributes(repo) -> bool:
+def ensure_exact_attributes(repo, *, new: bool = False) -> bool:
     """Make sure ``<repo>/info/attributes`` disables conversions; False if it cannot be written.
 
     Checked on every use, so repositories created before this rule are fixed as well. When the
@@ -77,6 +77,10 @@ def ensure_exact_attributes(repo) -> bool:
       and would not read them again, so the next snapshot would keep their converted content;
     * a marker is left so the next snapshot or undo can record which snapshots were stored before
       the rule (see :func:`_settle_legacy`); those are restored as stored, with a note.
+
+    The line is written last: if the index cannot be removed, the line is still missing and the
+    next call starts over, instead of leaving a repository that looks repaired and is not.
+    ``new=True`` says the repository has no snapshot yet, so neither the removal nor the marker.
 
     A repository directory that does not exist is left alone: there is nothing to convert, and
     the Git command that follows fails on its own.
@@ -92,9 +96,10 @@ def ensure_exact_attributes(repo) -> bool:
         except FileNotFoundError:
             pass
         target.parent.mkdir(parents=True, exist_ok=True)
-        (Path(repo) / LEGACY_PENDING).write_bytes(b"")
+        if not new:
+            (Path(repo) / LEGACY_PENDING).write_bytes(b"")
+            (Path(repo) / "index").unlink(missing_ok=True)
         target.write_text(EXACT_ATTRIBUTES, encoding="utf-8", newline="\n")
-        (Path(repo) / "index").unlink(missing_ok=True)
         return True
     except (OSError, UnicodeError):
         return False

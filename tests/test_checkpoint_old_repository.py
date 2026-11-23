@@ -79,6 +79,36 @@ class OldRepository(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((fresh_repo / checkpoints.LEGACY_HEAD).exists())
         self.assertTrue((await checkpoints.undo(fresh_key, fresh))["ok"])
 
+    async def test_a_failed_index_removal_is_tried_again_by_the_next_call(self):
+        await self.old_snapshot()
+        (self.ws / "new.txt").write_bytes(b"a new file\n")
+        real_unlink = Path.unlink
+
+        def index_in_use(path, *args, **kwargs):  # what Windows answers while another process has it open
+            if path.name == "index":
+                raise PermissionError(13, "in use")
+            return real_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", index_in_use):
+            self.assertIsNone(await checkpoints.snapshot(self.key, self.ws, "refused"))
+        attributes = checkpoints._repo_dir(self.key) / "info" / "attributes"
+        self.assertFalse(attributes.exists())  # still not repaired, so the next call starts over
+        self.assertIsNotNone(await checkpoints.snapshot(self.key, self.ws, "new"))
+        self.edit_all()
+        result = await checkpoints.undo(self.key, self.ws)
+        self.assertTrue(result["ok"], result)
+        for name, data in FILES.items():
+            self.assertEqual((self.ws / name).read_bytes(), data, name)
+        self.assertNotIn(checkpoints.LEGACY_NOTE, result["message"])
+
+    async def test_a_new_worktree_base_is_exact_and_has_no_legacy_record(self):
+        from engine import worktree_base
+        done = await worktree_base.capture("child-exact", self.ws)
+        self.assertTrue(done["ok"], done)
+        repo = checkpoints._repo_dir(done["repo_key"])
+        self.assertEqual((repo / "info" / "attributes").read_text(), checkpoints.EXACT_ATTRIBUTES)
+        self.assertFalse((repo / checkpoints.LEGACY_PENDING).exists())
+
 
 if __name__ == "__main__":
     unittest.main()
