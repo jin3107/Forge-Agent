@@ -17,6 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
+from . import proctree
 from .secrets import sanitized_env
 
 MAX_RUNNING = 8
@@ -125,16 +126,15 @@ async def start(command: str, workspace: Path, *, owner_id: str = "",
     try:
         env = sanitized_env({"TERM": "dumb", "NO_COLOR": "1"})
         scope = _scope(workspace, owner_id, session_id)
-        # Keep the group distinct from Forge's own process group on POSIX.
-        session_options = {"start_new_session": True} if os.name == "posix" else {}
+        # proctree isolates the command: its own process group on POSIX, a Job Object on Windows.
         if exec_args is not None:
-            creation = asyncio.create_subprocess_exec(
+            creation = proctree.spawn_exec(
                 *exec_args, cwd=str(workspace), stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, env=env, **session_options)
+                stderr=asyncio.subprocess.STDOUT, env=env)
         else:
-            creation = asyncio.create_subprocess_shell(
+            creation = proctree.spawn_shell(
                 command, cwd=str(workspace), stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT, env=env, **session_options)
+                stderr=asyncio.subprocess.STDOUT, env=env)
         spawn = asyncio.create_task(creation)
         try:
             proc = await asyncio.shield(spawn)
@@ -277,12 +277,24 @@ async def kill(tid: str, workspace: Path, *, owner_id: str = "", session_id: str
 async def _kill_task(t: dict) -> tuple[str, bool]:
     """Stop a trusted task; return message and whether cleanup is uncertain."""
     if t["status"] != "running":
+        if t.get("stop_unconfirmed") and os.name != "posix":
+            # The wrapper is gone but an earlier stop left the tree unconfirmed: stop it now.
+            leftover = proctree.tree_of(t["proc"])
+            if leftover is not None:
+                leftover.terminate()
+                if await leftover.confirm_gone(5):
+                    t["stop_unconfirmed"] = False
         uncertain = bool(t.get("stop_unconfirmed"))
         message = f"[{t['id']}] đã kết thúc trước đó ({t['status']}) — không cần kill."
         if uncertain:
             message += "\n⚠ process or group stop could not be confirmed"
         return message, uncertain
     fallback_warning = "\n⚠ Không thể kill nhóm; chỉ gửi tín hiệu tới tiến trình trực tiếp." if t.get("stop_direct_only") else ""
+    if t["killed"] and os.name != "posix":
+        # A retry after an unconfirmed stop: signal the job again; terminating twice is harmless.
+        retry_tree = proctree.tree_of(t["proc"])
+        if retry_tree is not None:
+            retry_tree.terminate()
     if not t["killed"]:
         if os.name == "posix":
             try:
@@ -306,8 +318,14 @@ async def _kill_task(t: dict) -> tuple[str, bool]:
                     return f"Error: [{t['id']}] không thể kill nhóm hoặc tiến trình; chưa xác nhận dừng.", True
                 fallback_warning = "\n⚠ Không thể kill nhóm; chỉ gửi tín hiệu tới tiến trình trực tiếp."
         else:
+            tree = proctree.tree_of(t["proc"])
             try:
-                t["proc"].kill()
+                if tree is not None:
+                    # Kill the whole Windows job, not just the cmd.exe wrapper.
+                    if not tree.terminate():
+                        raise OSError
+                else:
+                    t["proc"].kill()
             except ProcessLookupError:
                 t["stop_unconfirmed"] = True
                 return f"Error: [{t['id']}] process not found; stop could not be confirmed.", True
@@ -334,6 +352,12 @@ async def _kill_task(t: dict) -> tuple[str, bool]:
         t["wait_failed"] = True
         t["code"] = None
         return f"Error: [{t['id']}] exit status could not be confirmed after stop request; retry stop to wait again." + fallback_warning, True
+    tree = proctree.tree_of(t["proc"]) if os.name != "posix" else None
+    if tree is not None and not await tree.confirm_gone(5):
+        # The wrapper exited but a descendant is still alive: do not report a confirmed stop.
+        t["stop_unconfirmed"] = True
+        return (f"Error: [{t['id']}] the command tree is still running after the stop request; "
+                "retry stop.", True)
     # pump có thể chưa kịp chạy finally → tự cập nhật trạng thái ngay (tránh render sai)
     t["code"] = code
     t["status"] = "killed"

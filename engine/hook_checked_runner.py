@@ -14,7 +14,7 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Callable
 
-from . import hooks
+from . import hooks, proctree
 from .hook_approvals import Decision, Snapshot
 from .hook_snapshot import select_entries
 
@@ -233,6 +233,8 @@ async def _stop_legacy_process(proc):
             os.killpg(proc.pid, signal.SIGKILL)
         except (OSError, ProcessLookupError):
             pass
+    else:
+        proctree.terminate_windows_tree(proc)
     if proc.returncode is None:
         try:
             proc.kill()
@@ -288,9 +290,8 @@ async def checked_global_file_change(workspace: Path, owner_id: str, sid: str,
     from .secrets import sanitized_env
     env = sanitized_env({'FORGE_CHANGED_FILE': changed_path, 'FORGE_WORKSPACE': str(ws)})
     try:
-        proc = await asyncio.create_subprocess_shell(command, cwd=str(ws), env=env,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                    **({'start_new_session': True} if os.name == 'posix' else {}))
+        proc = await proctree.spawn_shell(command, cwd=str(ws), env=env,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
             out, truncated = await asyncio.wait_for(_capture_legacy_output(proc), timeout=_LEGACY_TIMEOUT)
             decoded = out.decode('utf-8', 'replace').strip()

@@ -22,6 +22,7 @@ import hashlib
 import os
 import signal
 
+from . import proctree
 from .secrets import sanitized_env
 import json
 import re
@@ -190,12 +191,17 @@ def _hook_format_output(capture, limit: int) -> str:
 
 async def _stop_hook_process(proc):
     """Best effort; an exited leader, escaped child, or interrupted cleanup can survive."""
-    if proc.returncode is None:
+    if proc.returncode is None or os.name != 'posix':
+        # On Windows the wrapper may have exited while the command still runs, so the job
+        # is terminated whatever the wrapper's state.
         if os.name == 'posix':
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except OSError:
                 pass
+        else:
+            proctree.terminate_windows_tree(proc)
+    if proc.returncode is None:
         try:
             proc.kill()
         except OSError:
@@ -209,11 +215,10 @@ async def _stop_hook_process(proc):
 async def _run_cmd(command: str, payload: dict, workspace: Path, env_extra: dict | None = None):
     env = sanitized_env({**(env_extra or {}), "FORGE_WORKSPACE": str(workspace)})
     try:
-        proc = await asyncio.create_subprocess_shell(
+        proc = await proctree.spawn_shell(
             command, cwd=str(workspace), env=env,
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **({'start_new_session': True} if os.name == 'posix' else {}))
+            stderr=asyncio.subprocess.PIPE)
         try:
             out, err = await asyncio.wait_for(
                 _hook_communicate_bounded(proc, json.dumps(payload, ensure_ascii=False).encode()), timeout=TIMEOUT)

@@ -75,7 +75,6 @@ class ForegroundDeadline(unittest.IsolatedAsyncioTestCase):
                     await asyncio.sleep(0.01)
             await asyncio.wait_for(wait_cleanup(), 3)
 
-    @unittest.skipUnless(os.name == 'posix', 'outside POSIX only the shell is stopped; the command would outlive the test')
     async def test_shell_creation_timeout_and_late_cleanup(self):
         await self.check_delayed_spawn(False)
 
