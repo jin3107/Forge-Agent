@@ -61,16 +61,30 @@ def _repo_dir(sid: str):
 EXACT_ATTRIBUTES = "* -text -filter -ident -working-tree-encoding -export-ignore -export-subst\n"
 
 
+LEGACY_PENDING = "forge-legacy-pending"   # written when the attributes were added to a repository
+LEGACY_HEAD = "forge-legacy-head"         # newest snapshot stored before that, i.e. possibly converted
+LEGACY_NOTE = ("Lưu ý: checkpoint này được tạo trước khi checkpoint lưu byte-exact, nên Git có thể "
+               "đã đổi line ending (CRLF→LF) của một số file khi lưu; đã khôi phục đúng như đã lưu.")
+
+
 def ensure_exact_attributes(repo) -> bool:
     """Make sure ``<repo>/info/attributes`` disables conversions; False if it cannot be written.
 
-    Checked on every use, so repositories created before this rule are fixed as well. Snapshots
-    they already hold were stored converted and are restored as stored.
+    Checked on every use, so repositories created before this rule are fixed as well. When the
+    line has to be written into a repository that already exists, two more things follow:
+
+    * the file index is removed, because Git trusts it for files whose timestamps did not change
+      and would not read them again, so the next snapshot would keep their converted content;
+    * a marker is left so the next snapshot or undo can record which snapshots were stored before
+      the rule (see :func:`_settle_legacy`); those are restored as stored, with a note.
+
+    A repository directory that does not exist is left alone: there is nothing to convert, and
+    the Git command that follows fails on its own.
     """
     try:
         # Never create a repository directory (or a stray tree in the cwd) just for this file.
         if not Path(repo).is_dir():
-            return False
+            return True
         target = Path(repo) / "info" / "attributes"
         try:
             if target.read_text(encoding="utf-8") == EXACT_ATTRIBUTES:
@@ -78,10 +92,53 @@ def ensure_exact_attributes(repo) -> bool:
         except FileNotFoundError:
             pass
         target.parent.mkdir(parents=True, exist_ok=True)
+        (Path(repo) / LEGACY_PENDING).write_bytes(b"")
         target.write_text(EXACT_ATTRIBUTES, encoding="utf-8", newline="\n")
+        (Path(repo) / "index").unlink(missing_ok=True)
         return True
     except (OSError, UnicodeError):
         return False
+
+
+_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+
+async def _settle_legacy(repo, git) -> bool:
+    """Record the snapshots that exist when the rule is first applied; False if that failed.
+
+    ``git(*args)`` runs a Git command on the checkpoint repository and returns ``(rc, output)``.
+    Everything up to and including the head at that moment was stored under the user's Git
+    configuration and may be converted. Runs before any new snapshot, so the head is that state.
+    """
+    pending = Path(repo) / LEGACY_PENDING
+    try:
+        if not pending.exists():
+            return True
+        rc, _ = await git("show-ref", "--verify", "--quiet", "refs/heads/forge")
+        if rc == 0:
+            rc, head = await git("rev-parse", "refs/heads/forge")
+            head = head.strip()
+            if rc != 0 or not _OID.fullmatch(head):
+                return False
+            (Path(repo) / LEGACY_HEAD).write_text(head, encoding="ascii")
+        elif rc != 1:
+            return False
+        pending.unlink(missing_ok=True)
+        return True
+    except (OSError, UnicodeError):
+        return False
+
+
+async def _is_legacy(repo, git, oid: str) -> bool:
+    """True when snapshot ``oid`` was stored before the rule and may be converted."""
+    try:
+        head = (Path(repo) / LEGACY_HEAD).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError):
+        return False
+    if not _OID.fullmatch(head):
+        return False
+    rc, _ = await git("merge-base", "--is-ancestor", oid, head)
+    return rc == 0
 
 
 def _git_args(sid: str, workspace) -> list[str]:
@@ -255,7 +312,7 @@ async def snapshot(sid: str, workspace, label: str, *, on_detached_cleanup=None,
             if rc != 0:
                 return None
     # Fail closed: a snapshot taken with conversions active cannot be restored byte-exact.
-    if not ensure_exact_attributes(repo):
+    if not ensure_exact_attributes(repo) or not await _settle_legacy(repo, run):
         return None
 
     pathspec = ["--", "."] + [f":(exclude){e}" for e in EXCLUDES]
@@ -307,7 +364,13 @@ async def undo(sid: str, workspace) -> dict:
     rc, cur = await _run_with_env(base + ["rev-parse", "refs/heads/forge"], env)
     if rc != 0:
         return {"ok": False, "message": "Chưa có checkpoint nào để undo"}
-    if not ensure_exact_attributes(repo):
+    async def git(*args: str) -> tuple[int, str]:
+        try:
+            return await _run_with_env(base + list(args), env)
+        except Exception:
+            return 125, ""
+
+    if not ensure_exact_attributes(repo) or not await _settle_legacy(repo, git):
         return {"ok": False, "message": "Không thể tắt chuyển đổi nội dung của Git cho checkpoint; undo chưa được thực hiện."}
     cur = cur.strip()
     if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", cur):
@@ -349,6 +412,8 @@ async def undo(sid: str, workspace) -> dict:
             return {"ok": False, "message": ("Checkpoint đích theo dõi đường dẫn thuộc diện loại trừ; "
                                              "undo chưa được thực hiện để tránh ghi đè dữ liệu.")}
 
+    legacy = await _is_legacy(repo, git, cur)
+
     # These steps are not transactional: stop on the first failure and do not
     # claim success, since earlier steps may already have changed the workspace.
     steps = [
@@ -371,7 +436,10 @@ async def undo(sid: str, workspace) -> dict:
             return {"ok": False, "message": (f"Undo thất bại tại bước git {step[0]} ({status}). "
                                               "Workspace hoặc checkpoint có thể đã thay đổi một phần; "
                                               "hãy kiểm tra trước khi tiếp tục.")}
-    return {"ok": True, "message": f"Đã hoàn tác về checkpoint ({cur[:10]})"}
+    message = f"Đã hoàn tác về checkpoint ({cur[:10]})"
+    if legacy:
+        message += ". " + LEGACY_NOTE
+    return {"ok": True, "message": message}
 
 
 async def list_checkpoints(sid: str, workspace) -> list[str]:
