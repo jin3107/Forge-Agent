@@ -28,7 +28,8 @@ class NonUtf8Output(unittest.TestCase):
         code = ("import sys, engine\n"
                 "print('[hooks] stop lỗi (bỏ qua): x')\n"
                 "print('[hooks] stderr lỗi', file=sys.stderr)\n")
-        for encoding in ("cp1252", "ascii"):
+        # strict is PYTHONIOENCODING=cp1252; surrogateescape is the default of Python on Windows
+        for encoding in ("cp1252", "ascii", "cp1252:surrogateescape", "ascii:surrogateescape"):
             with self.subTest(encoding=encoding):
                 done = run(["-c", code], encoding)
                 self.assertEqual(done.returncode, 0, done.stderr.decode("ascii", "replace"))
@@ -44,8 +45,10 @@ class NonUtf8Output(unittest.TestCase):
 
     def test_a_handler_that_means_to_continue_continues(self):
         with tempfile.TemporaryDirectory() as data:
-            done = run(["-m", "unittest", *HOOK_TESTS], "cp1252", data_dir=data)
-        self.assertEqual(done.returncode, 0, done.stderr.decode("ascii", "replace")[-1500:])
+            for encoding in ("cp1252", "cp1252:surrogateescape"):
+                with self.subTest(encoding=encoding):
+                    done = run(["-m", "unittest", *HOOK_TESTS], encoding, data_dir=data)
+                    self.assertEqual(done.returncode, 0, done.stderr.decode("ascii", "replace")[-1500:])
 
 
 if __name__ == "__main__":
