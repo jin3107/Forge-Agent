@@ -332,6 +332,10 @@ async def set_user_enabled(user_id: str, body: EnabledBody,
         if len(admins) <= 1:
             raise HTTPException(400, "Phải giữ ít nhất một admin đang hoạt động")
     auth_store.set_enabled(user_id, body.enabled)
+    if not body.enabled:
+        from engine import scheduler as fsched
+        fsched.manager.stop_owner(user_id, "owner_disabled",
+                                  f"Loop stopped: account {target.email} was disabled.")
     updated = auth_store.get(user_id)
     assert updated is not None
     return updated.public()

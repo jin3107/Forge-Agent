@@ -2,6 +2,7 @@
 import asyncio
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,7 +30,7 @@ class ForegroundSpawnCancellation(unittest.IsolatedAsyncioTestCase):
             await release.wait()
             return proc
         argv = [sys.executable, '-u', '-c', 'import time; time.sleep(30)']
-        command = 'exec ' + ' '.join(shlex.quote(x) for x in argv) if os.name == 'posix' else ' '.join(argv)
+        command = 'exec ' + ' '.join(shlex.quote(x) for x in argv) if os.name == 'posix' else subprocess.list2cmdline(argv)
         with patch('engine.tools._prepare_command', return_value=(None, argv if exec_path else None)), \
              patch(f'engine.tools.asyncio.{method}', side_effect=delayed):
             task = asyncio.create_task(tools._run_command_result(self.ws, {'command': command}))

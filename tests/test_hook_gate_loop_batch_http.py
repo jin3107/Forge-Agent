@@ -427,13 +427,17 @@ class LoopBatchBattleGateHTTP(FixtureServerCase):
 
         self.assertEqual(self.admin.patch(account, json={'enabled': False}).status_code, 200)
         self.assertEqual(owner.get(url).status_code, 401)  # so the owner cannot ask for the loop state
-        time.sleep(LOOP_INTERVAL + 5)  # the next tick is due within the interval
+        time.sleep(LOOP_INTERVAL + 5)  # the next tick would be due within the interval
         self.assertEqual(self.provider_calls() - before, per_tick)  # no turn ran for the disabled owner
 
         self.assertEqual(self.admin.patch(account, json={'enabled': True}).status_code, 200)
         state = self.loop_state(sid, self.login('member2@example.test'))
-        self.assert_tick_denied(state)  # and the loop did not go on after the account was enabled again
-        self.assertEqual(state.get('runs'), 2, state)
+        # Disabling the account ended the loop at once, before its next tick, with a reason that
+        # names the account; it did not go on after the account was enabled again.
+        self.assertIs(state.get('finished'), True, state)
+        self.assertIs(state.get('last_ok'), False, state)
+        self.assertEqual(state.get('last_error_code'), 'owner_disabled', state)
+        self.assertEqual(state.get('runs'), 1, state)
         self.assertEqual(self.provider_calls() - before, per_tick)
 
     def test_batch_item_cannot_run_a_hook_that_its_own_turn_wrote(self):

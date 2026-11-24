@@ -47,6 +47,7 @@ class TrustScheduler(unittest.IsolatedAsyncioTestCase):
         agent=SimpleNamespace(send=send)
         with patch.object(main,'ScopedSessionStore',return_value=store), \
              patch.object(main,'Agent',return_value=agent), \
+             patch.object(main,'_loop_owner_denial',return_value=None), \
              patch.object(main.config,'has_provider_credentials',return_value=True):
             manager.start('s',0,'work','agent',main._loop_runner('owner',False))
             await asyncio.wait_for(manager._loops['s']['task'],1)

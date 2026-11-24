@@ -682,6 +682,9 @@ async def list_models(user: User = Depends(require_user), provider: str | None =
 async def delete_session(sid: str, user: User = Depends(require_user)):
     db = _db(user)
     ok = db.delete(sid)
+    if ok:
+        from engine import scheduler as fsched
+        fsched.manager.stop(sid)  # a loop must not outlive its session
     return {"ok": ok}
 
 
@@ -814,12 +817,30 @@ class LoopBody(BaseModel):
     max_runs: int = 0  # 0 = tới khi /loop stop hoặc restart server
 
 
+def _loop_owner_denial(owner_id: str) -> tuple[str, str] | None:
+    """(code, message) when the loop's account may no longer run it, else None. Fails closed."""
+    try:
+        owner = auth_web.auth_store.get(owner_id)
+    except Exception:
+        return "owner_check_failed", "Loop stopped: the owner account could not be checked."
+    if owner is None:
+        return "owner_missing", f"Loop stopped: account {owner_id} no longer exists."
+    if not owner.enabled:
+        return "owner_disabled", f"Loop stopped: account {owner.email} is disabled."
+    return None
+
+
 async def _loop_turn(sid: str, text: str, mode: str, owner_id: str, allow_mcp: bool) -> str:
     """Mỗi nhịp tự mở scoped store; không giữ quyền/global store trong closure."""
+    from engine import scheduler as fsched
+    # Every tick, demo or not, starts by checking the account: a disabled owner's loop ends here.
+    denial = _loop_owner_denial(owner_id)
+    if denial:
+        raise fsched.LoopStop(*denial)
     db = ScopedSessionStore(store, owner_id, allow_mcp=allow_mcp)
     st = db.get(sid)
     if not st:
-        return "(phiên đã xoá)"
+        raise fsched.LoopStop("session_deleted", "Loop stopped: its session no longer exists.")
     demo = not config.has_provider_credentials(llm.split_model_id(st.model)[0])
     if demo:
         agent = Agent(db, sid, router=model_router)
@@ -851,7 +872,8 @@ async def loop_start(sid: str, body: LoopBody, user: User = Depends(require_user
     every_s = fsched.parse_interval(body.every, default_minutes=30)
     mode = body.mode if body.mode in ("direct", "agent", "plan", "architect") else "agent"
     max_runs = max(0, min(int(body.max_runs), 10000))
-    status = fsched.manager.start(sid, every_s, body.text.strip(), mode, _loop_runner(user.id, user.role == "admin"), max_runs)
+    status = fsched.manager.start(sid, every_s, body.text.strip(), mode, _loop_runner(user.id, user.role == "admin"), max_runs,
+                                   owner_id=user.id)
     return {"ok": True, "status": status,
             "note": "Loop sống trong tiến trình server — restart là dừng"}
 
@@ -868,6 +890,19 @@ async def loop_status(sid: str, user: User = Depends(require_user)):
 async def loop_stop(sid: str, user: User = Depends(require_user)):
     if not _db(user).get(sid):
         raise HTTPException(404, "Session not found")
+    from engine import scheduler as fsched
+    return {"ok": fsched.manager.stop(sid)}
+
+
+@app.get("/api/admin/loops")
+async def admin_loops(user: User = Depends(require_admin)):
+    """Running loops of all accounts (no task text), so an administrator can see and stop them."""
+    from engine import scheduler as fsched
+    return {"loops": fsched.manager.status_all()}
+
+
+@app.delete("/api/admin/loops/{sid}")
+async def admin_loop_stop(sid: str, user: User = Depends(require_admin)):
     from engine import scheduler as fsched
     return {"ok": fsched.manager.stop(sid)}
 
@@ -1129,8 +1164,8 @@ async def chat(sid: str, body: ChatBody, request: Request, user: User = Depends(
                                "content": "⚪ Đã dừng loop." if was else "(không có loop nào đang chạy)"}]
         elif not l_arg:
             st_loop = fsched.manager.status(sid)
-            if st_loop.get("last_error_code") == "hook_trust_denied":
-                loop_message = ("⛔ Loop dừng: hook_trust_denied. " + st_loop["last_error"])
+            if st_loop.get("last_error_code"):
+                loop_message = ("⛔ Loop dừng: " + st_loop["last_error_code"] + ". " + st_loop["last_error"])
             elif st_loop["running"]:
                 loop_message = ("🔁 Đang chạy: mỗi `" + fsched.fmt_interval(st_loop["every"])
                                 + "` — «" + st_loop["text"] + "» ("
@@ -1147,7 +1182,8 @@ async def chat(sid: str, body: ChatBody, request: Request, user: User = Depends(
                                    "content": "❌ Thiếu tác vụ: `/loop <30m|1h> <tác vụ>`"}]
             else:
                 mode_l = chat_mode if chat_mode != "plan" else "agent"
-                status_l = fsched.manager.start(sid, every_s, task_text, mode_l, _loop_runner(user.id, user.role == "admin"))
+                status_l = fsched.manager.start(sid, every_s, task_text, mode_l, _loop_runner(user.id, user.role == "admin"),
+                                                owner_id=user.id)
                 loop_synthetic = [{"type": "assistant_message",
                                    "content": f"🔁 Loop BẬT — mỗi `{fsched.fmt_interval(status_l['every'])}` chạy «{task_text}» "
                                               "(tool + audit như chat thường; sống trong tiến trình server, restart là dừng; `/loop off` để tắt)"}]

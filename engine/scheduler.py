@@ -48,6 +48,15 @@ def fmt_interval(seconds: int) -> str:
     return f"{seconds}s"
 
 
+class LoopStop(Exception):
+    """Raised by a loop turn to end its loop for good, with a machine-readable reason."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class LoopManager:
     """Quản lý loop theo phiên — một phiên MỘT loop (start đè loop cũ)."""
 
@@ -55,10 +64,13 @@ class LoopManager:
         self._loops: dict[str, dict] = {}
 
     def start(self, sid: str, every_s: int, text: str, mode: str,
-              run_fn, max_runs: int = 0) -> dict:
-        """run_fn(sid, text, mode) → coroutine chạy 1 lượt. max_runs=0 = vô hạn."""
+              run_fn, max_runs: int = 0, owner_id: str = "") -> dict:
+        """run_fn(sid, text, mode) → coroutine chạy 1 lượt. max_runs=0 = vô hạn.
+
+        owner_id lets an account's loops be stopped together (see stop_owner).
+        """
         self.stop(sid)
-        st: dict = {"every": int(every_s), "text": text, "mode": mode,
+        st: dict = {"every": int(every_s), "text": text, "mode": mode, "owner": owner_id,
                     "runs": 0, "max": int(max_runs), "started": time.time(),
                     "last_ok": None, "task": None}
 
@@ -73,6 +85,11 @@ class LoopManager:
                         st["last_ok"] = False
                         st["last_error_code"] = "hook_trust_denied"
                         st["last_error"] = str(exc)
+                        break
+                    except LoopStop as exc:
+                        st["last_ok"] = False
+                        st["last_error_code"] = exc.code
+                        st["last_error"] = exc.message
                         break
                     except Exception as e:  # noqa: BLE001 — lượt hỏng không chết loop
                         st["last_ok"] = False
@@ -116,14 +133,34 @@ class LoopManager:
                "since": int(time.time() - ent["started"])}
         if not running:
             out.pop("since")
-        if ent.get("last_error_code") == "hook_trust_denied":
+        if ent.get("last_error_code"):
             out["last_error_code"] = ent["last_error_code"]
             out["last_error"] = ent["last_error"]
         return out
 
+    def stop_owner(self, owner_id: str, code: str, message: str) -> int:
+        """End every running loop of one account. The entries stay as a report with the reason."""
+        stopped = 0
+        for ent in self._loops.values():
+            task = ent.get("task")
+            if ent.get("owner") != owner_id or not task:
+                continue
+            ent.update(task=None, finished=True, last_ok=False,
+                       last_error_code=code, last_error=message)
+            if not task.done():
+                task.cancel()
+            stopped += 1
+        return stopped
+
     def status_all(self) -> list[dict]:
-        return [{"session": sid, **self.status(sid)}
-                for sid in list(self._loops) if self.status(sid)["running"]]
+        """Running loops of every account, for administrators. The task text is not included."""
+        rows = []
+        for sid in list(self._loops):
+            status = self.status(sid)
+            if status["running"]:
+                status.pop("text", None)
+                rows.append({"session": sid, "owner": self._loops[sid].get("owner", ""), **status})
+        return rows
 
 
 manager = LoopManager()
